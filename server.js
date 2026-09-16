@@ -1841,18 +1841,39 @@ async function homeGetExtCards(siteKey, tab) {
         return cached.results.slice(0, 10);
     }
     try {
-        let tabArg = { id: tab, page: 1 };
-        if (tab === 'home') {
-            const cfg = await runExtJs(site, 'getConfig', {}, {}).catch(() => null);
-            if (cfg && cfg.tabs && cfg.tabs.length) {
-                const nonFilter = cfg.tabs.find(t => !t.ext || t.ext.type !== 'filter') || cfg.tabs[0];
-                tabArg = { ...(nonFilter.ext || { id: nonFilter.id || 'home' }), page: 1 };
+        const loadCards = async (routeMode = '') => {
+            const runOpts = routeMode ? { routeMode } : {};
+            let tabArg = { id: tab, page: 1 };
+            if (tab === 'home') {
+                const cfg = await runExtJs(site, 'getConfig', {}, runOpts).catch(() => null);
+                if (cfg && cfg.tabs && cfg.tabs.length) {
+                    const nonFilter = cfg.tabs.find(t => !t.ext || t.ext.type !== 'filter') || cfg.tabs[0];
+                    tabArg = { ...(nonFilter.ext || { id: nonFilter.id || 'home' }), page: 1 };
+                }
+            }
+            const r = await runExtJs(site, 'getCards', tabArg, runOpts);
+            return r && Array.isArray(r.list) ? r.list : [];
+        };
+
+        let items = await loadCards();
+        // 与 /api/ext/cards 相同：HTTP200空页时先走代理、再走纯直连，兼容两类地区限制源
+        if (items.length === 0 && siteKey !== 'huangguo') {
+            for (const routeMode of ['proxy', 'direct']) {
+                try {
+                    const retried = await loadCards(routeMode);
+                    if (retried.length > 0) {
+                        items = retried;
+                        console.log(`[HOME] ${site.name} auto empty, recovered via ${routeMode}: ${retried.length}`);
+                        break;
+                    }
+                } catch (e) {
+                    console.warn(`[HOME] ${site.name} ${routeMode} retry failed: ${e.message}`);
+                }
             }
         }
-        const r = await runExtJs(site, 'getCards', tabArg, {});
-        if (r && Array.isArray(r.list)) {
-            let items = r.list;
-            if (items.length > 0) recordSiteHealth(siteKey, true); else recordSiteHealth(siteKey, false);
+
+        if (items.length > 0) {
+            recordSiteHealth(siteKey, true);
             const results = items.map(item => {
                 const id = String(item.vod_id || item.id || item.ext?.id || '');
                 const name = item.vod_name || item.name || item.title || '';
@@ -1873,6 +1894,7 @@ async function homeGetExtCards(siteKey, tab) {
             if (results.length > 0) cacheManager.set('detail', `ext_cards_${siteKey}_${tab}_1`, data, 300);
             return results.slice(0, 10);
         }
+        recordSiteHealth(siteKey, false);
         return [];
     } catch (e) {
         recordSiteHealth(siteKey, false);
