@@ -2,20 +2,27 @@ name: Docker Build & Publish (Multi-Arch)
 
 on:
   push:
-    # Publish semver tags as releases.
+    # 推到 main 立即同步最新镜像 (latest)
+    branches: [ "main" ]
+    # 打版本标签时发布对应版本镜像 (v1.2.3 -> 1.2.3)
     tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
 
 env:
   GHCR_REGISTRY: ghcr.io
-  DOCKERHUB_IMAGE: ednovas/dongguatv
-  # ghcr.io requires lowercase image names
+  # ghcr.io requires lowercase image names -> qingwo1991-debug/dongguatv
   GHCR_IMAGE: ${{ github.repository_owner }}/dongguatv
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -24,28 +31,46 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 设置 QEMU 用于多架构模拟构建
+      # 设置 QEMU 用于多架构模拟构建 (与下方 platforms 保持一致)
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm64
 
       # 设置 Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 登录 GitHub Container Registry
+      # 计算推送目标: GHCR 必推; Docker Hub 仅在配置了凭据 secrets 时才推
+      - name: Resolve target registries
+        id: targets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          IMAGES="ghcr.io/${{ env.GHCR_IMAGE }}"
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            IMAGES="$IMAGES,$DOCKERHUB_USERNAME/dongguatv"
+            echo "dockerhub=true" >> "$GITHUB_OUTPUT"
+            echo "dockerhub_username=$DOCKERHUB_USERNAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerhub=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "images=$IMAGES" >> "$GITHUB_OUTPUT"
+          echo "🔗 Target images: $IMAGES"
+
+      # 登录 GitHub Container Registry (用内置 GITHUB_TOKEN, 无需额外配置)
       - name: Log into GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 登录 Docker Hub
-      - name: Log into Docker Hub
-        if: github.event_name != 'pull_request'
+      # 登录 Docker Hub (可选, 仅在配置了 secrets 时执行)
+      - name: Log into Docker Hub (optional)
+        if: steps.targets.outputs.dockerhub == 'true' && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -55,12 +80,15 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE }}
-            docker.io/${{ env.DOCKERHUB_IMAGE }}
+          images: ${{ steps.targets.outputs.images }}
           tags: |
-            type=raw,value=latest
+            # main 分支 -> latest; semver tag -> 版本号
+            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+          flavor: |
+            latest=auto
 
       # 多架构构建并推送
       - name: Build and push Docker image (Multi-Arch)
@@ -68,14 +96,16 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          # 支持的架构: AMD64 (x86_64), ARM64 (Apple M1/M2, 树莓派4), ARMv7 (树莓派3, 旧版ARM设备)
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          file: Dockerfile
+          # 支持的架构: AMD64 (x86_64 服务器/云主机), ARM64 (Apple M 系列, 树莓派4)
+          # ARMv7(树莓派3/旧盒子) 如需支持, 须先在 setup-qemu 注册 linux/arm/v7 模拟器后再启用
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # 禁用 provenance 并使用 Docker manifest v2 格式 (兼容旧版 Docker)
+          # 禁用 provenance 并使用 Docker manifest v2 格式 (兼容旧版 Docker / 宝塔)
           provenance: false
           sbom: false
           outputs: type=image,oci-mediatypes=false
