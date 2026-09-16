@@ -1831,7 +1831,7 @@ async function homeFetchTmdb(path, page = 1) {
     }
 }
 
-async function homeGetExtCards(siteKey, tab) {
+async function homeGetExtCards(siteKey, tab, timeoutMs = 8000) {
     const sites = getDB().sites;
     const site = sites.find(s => s.key === siteKey && isExtSite(s));
     if (!site) return [];
@@ -1854,8 +1854,8 @@ async function homeGetExtCards(siteKey, tab) {
             const r = await runExtJs(site, 'getCards', tabArg, runOpts);
             return r && Array.isArray(r.list) ? r.list : [];
         };
-        // 每源 8s 独立截止：单行慢/坏源不拖累整个首页聚合
-        const withTimeout = (p, ms = 8000) => Promise.race([
+        // 每源独立截止：单行慢/坏源不拖累整个首页聚合
+        const withTimeout = (p, ms = timeoutMs) => Promise.race([
             p,
             new Promise((_, rej) => setTimeout(() => rej(new Error('home-timeout')), ms))
         ]);
@@ -1864,7 +1864,7 @@ async function homeGetExtCards(siteKey, tab) {
         if (items.length === 0 && siteKey !== 'huangguo') {
             for (const routeMode of ['proxy', 'direct']) {
                 try {
-                    const retried = await withTimeout(loadCards(routeMode), 6000);
+                    const retried = await withTimeout(loadCards(routeMode), Math.min(6000, timeoutMs));
                     if (retried.length > 0) {
                         items = retried;
                         console.log(`[HOME] ${site.name} auto empty, recovered via ${routeMode}: ${retried.length}`);
@@ -1907,38 +1907,73 @@ async function homeGetExtCards(siteKey, tab) {
     }
 }
 
+// /api/home：内存快照 + stale-while-revalidate，绝不让用户等坏源超时。
+// 每次请求：新鲜(<90s)直接返回；过期则先返回旧快照，后台异步重建（只重建未缓存行）。
+let homeSnapshot = null;      // { hero, rows, updatedAt }
+let homeSnapshotBuilding = false; // 重建中防并发
+let warmupPromise = null;     // P0-3 启动预热 promise（route 首次构建等待它完成，避免与 warmup 重复拉源）
+const HOME_SNAPSHOT_TTL = 90000;
+const HOME_CARD_TTL = 300;   // ext_cards 单行缓存 5 分钟，重建成行秒回
+
+async function buildHomeSnapshot() {
+    const keys = HOME_ROW_KEYS;
+    const [heroData, ...rowDatas] = await Promise.all([
+        homeFetchTmdb('/trending/all/week', 1),
+        ...keys.map(k => {
+            const t = HOME_EXT_TARGETS[k];
+            return homeGetExtCards(t ? t[0] : 'huangguo', t ? t[1] : 'home');
+        })
+    ]);
+    const hero = (heroData && Array.isArray(heroData.results))
+        ? heroData.results.filter(i => i.backdrop_path).slice(0, 5).map(item => ({
+            title: item.title || item.name,
+            originalTitle: item.original_title || item.original_name || '',
+            overview: item.overview || '精彩内容不容错过',
+            backdrop: item.backdrop_path,
+            poster: item.poster_path || '',
+            rawData: item
+        }))
+        : [];
+    const rows = keys.map((key, idx) => ({
+        key,
+        results: (rowDatas[idx] || []).slice(0, 10)
+    }));
+    return { hero, rows: siteHealthRows(rows), sorted: true, updatedAt: Date.now() };
+}
+
 app.get('/api/home', async (req, res) => {
     try {
-        const cacheKey = 'home_aggregate_v1';
-        const cached = cacheManager.get('detail', cacheKey);
-        if (cached) return res.json(cached);
+        const now = Date.now();
+        const fresh = homeSnapshot && (now - homeSnapshot.updatedAt < HOME_SNAPSHOT_TTL);
+        if (fresh) return res.json(homeSnapshot);
 
-        // hero：TMDB 热门（复用前端 fetchHero 相同源）
-        const [heroData, ...rowDatas] = await Promise.all([
-            homeFetchTmdb('/trending/all/week', 1),
-            ...HOME_ROW_KEYS.map(k => homeGetExtCards(HOME_EXT_TARGETS[k] ? HOME_EXT_TARGETS[k][0] : 'huangguo', HOME_EXT_TARGETS[k] ? HOME_EXT_TARGETS[k][1] : 'home'))
-        ]);
+        // 有过期快照：立即返回旧数据，后台重建（stale-while-revalidate）
+        if (homeSnapshot) {
+            const stale = homeSnapshot;
+            if (!homeSnapshotBuilding) {
+                homeSnapshotBuilding = true;
+                setImmediate(() => {
+                    buildHomeSnapshot().then(snap => {
+                        if (snap && snap.rows.length) { homeSnapshot = snap; }
+                    }).catch(e => console.warn('[HOME] 后台重建失败:', e.message))
+                    .finally(() => { homeSnapshotBuilding = false; });
+                });
+            }
+            return res.json(stale);
+        }
 
-        const hero = (heroData && Array.isArray(heroData.results))
-            ? heroData.results.filter(i => i.backdrop_path).slice(0, 5).map(item => ({
-                title: item.title || item.name,
-                originalTitle: item.original_title || item.original_name || '',
-                overview: item.overview || '精彩内容不容错过',
-                backdrop: item.backdrop_path,
-                poster: item.poster_path || '',
-                rawData: item
-            }))
-            : [];
-
-        const rows = HOME_ROW_KEYS.map((key, idx) => ({
-            key,
-            results: (rowDatas[idx] || []).slice(0, 10)
-        }));
-
-        // P3: 前端按服务端返回顺序渲染，这里已按健康度排序（健康源前置）
-        const payload = { hero, rows: siteHealthRows(rows), sorted: true, updatedAt: Date.now() };
-        cacheManager.set('detail', cacheKey, payload, 90);
-        res.json(payload);
+        // 无快照：首次构建（首个用户等待，坏源 8s 封顶；若 warmup 正在跑则等它完成复用缓存）
+        homeSnapshotBuilding = true;
+        try {
+            if (warmupPromise) {
+                try { await warmupPromise; } catch (e) { }
+            }
+            const snap = await buildHomeSnapshot();
+            if (snap && snap.rows.length) homeSnapshot = snap;
+            res.json(homeSnapshot || { hero: [], rows: [], sorted: true });
+        } finally {
+            homeSnapshotBuilding = false;
+        }
     } catch (err) {
         console.error('[HOME] Aggregate error:', err.message);
         res.status(502).json({ error: 'Home aggregate failed', hero: [], rows: [] });
@@ -1947,44 +1982,29 @@ app.get('/api/home', async (req, res) => {
 
 // ========== P0-3 启动预热：重启后立即并行预热首页各源结构+首卡，配合磁盘缓存“重启不冷” ==========
 async function startupWarmup() {
-    try {
-        console.log('[P0-3] 启动预热开始 (HOME rows 前台 + 扩展源后台)...');
-        const keys = Object.keys(HOME_EXT_TARGETS);
-        await Promise.allSettled(keys.map(async (k) => {
-            const [siteKey, tab] = HOME_EXT_TARGETS[k];
-            try { await homeGetExtCards(siteKey, tab); } catch (e) { }
-        }));
-        // 顺手构建聚合缓存，让首个用户秒开
+    // 预热 promise 存全局：route 首次构建等待它，避免重复拉源
+    warmupPromise = (async () => {
         try {
-            const cacheKey = 'home_aggregate_v1';
-            if (!cacheManager.get('detail', cacheKey)) {
-                const [heroData, ...rowDatas] = await Promise.all([
-                    homeFetchTmdb('/trending/all/week', 1),
-                    ...keys.map(k => homeGetExtCards(HOME_EXT_TARGETS[k][0], HOME_EXT_TARGETS[k][1]))
-                ]);
-                const hero = (heroData && Array.isArray(heroData.results))
-                    ? heroData.results.filter(i => i.backdrop_path).slice(0, 5).map(i => ({
-                        title: i.title || i.name,
-                        originalTitle: i.original_title || i.original_name || '',
-                        overview: i.overview || '精彩内容不容错过',
-                        backdrop: i.backdrop_path,
-                        poster: i.poster_path || '',
-                        rawData: i
-                    }))
-                    : [];
-                const rows = siteHealthRows(keys.map(k => ({
-                    key: k,
-                    results: (rowDatas.shift() || []).slice(0, 8)
-                })));
-                cacheManager.set('detail', cacheKey, { hero, rows, sorted: true, updatedAt: Date.now() }, 90);
+            console.log('[P0-3] 启动预热开始 (HOME rows 前台 + 扩展源后台)...');
+            const keys = Object.keys(HOME_EXT_TARGETS);
+            // 3s 短超时预热：快源先缓存，坏源不阻塞（3s 后放弃留给 route 实时拉）
+            await Promise.allSettled(keys.map(async (k) => {
+                const [siteKey, tab] = HOME_EXT_TARGETS[k];
+                try { await homeGetExtCards(siteKey, tab, 3000); } catch (e) { }
+            }));
+            // 构建聚合快照：此时各行大多已命中 ext_cards 缓存，秒回
+            try {
+                const snap = await buildHomeSnapshot();
+                if (snap && snap.rows.length) homeSnapshot = snap;
+                console.log(`[P0-3] 启动预热完成 (${snap.rows.length} 行)`);
+            } catch (e) {
+                console.warn('[P0-3] Aggregate warmup skipped:', e.message);
             }
         } catch (e) {
-            console.warn('[P0-3] Aggregate warmup skipped:', e.message);
+            console.warn('[P0-3] 启动预热异常:', e.message);
         }
-        console.log('[P0-3] 启动预热完成');
-    } catch (e) {
-        console.warn('[P0-3] 启动预热异常:', e.message);
-    }
+    })();
+    try { await warmupPromise; } catch (e) { }
 }
 
 // 1. 获取站点列表
@@ -2960,8 +2980,9 @@ if (!process.env.VERCEL) {
     app.listen(PORT, () => {
         console.log(`Server running on http://localhost:${PORT}`);
         console.log(`Image Cache Directory: ${IMAGE_CACHE_DIR}`);
-        // P0-3 启动预热：延迟数秒在后台预热首页各源 + 构建聚合缓存（不阻塞首启响应）
-        setTimeout(() => { startupWarmup().catch(() => { }); }, 3000);
+        // P0-3 启动预热：立即后台预热首页各源 + 构建聚合缓存（不阻塞 listen 回调本身）
+        // 预热并行填充 ext_cards 5 分钟缓存，首个 /api/home 请求即可秒回（各源走缓存命中）
+        startupWarmup().catch(() => { });
     });
 }
 
