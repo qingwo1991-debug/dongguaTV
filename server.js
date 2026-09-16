@@ -2054,10 +2054,13 @@ app.get('/api/search', async (req, res) => {
             : (includeNsfw ? sites : sites.filter(s => !isNsfwSite(s)));
 
         const allResults = [];
-        const searchPromises = targetSites.map(async (site) => {
+        // ⚖️ 非流式(直达用)同样健康源优先：加快 playRecommendation 等路径在 8s 边界内拿到优质源
+        const targetRanked = [...targetSites].sort((a, b) => siteHealthScore(b.key) - siteHealthScore(a.key));
+        const searchPromises = targetRanked.map(async (site) => {
             const cacheKey = `${site.key}_${keyword}`;
             const cached = cacheManager.get('search', cacheKey);
             if (cached && cached.list) {
+                recordSiteHealth(site.key, true);
                 cached.list.forEach(item => {
                     allResults.push({ ...item, site_key: site.key, site_name: site.name });
                 });
@@ -2067,6 +2070,7 @@ app.get('/api/search', async (req, res) => {
                 if (isExtSite(site)) {
                     // XPTV js 扩展源: 调用 search()
                     const extList = await extSearch(site, keyword);
+                    recordSiteHealth(site.key, true);
                     cacheManager.set('search', cacheKey, { list: extList }, 3600);
                     allResults.push(...(extList.map(item => ({ ...item, site_key: site.key, site_name: site.name }))));
                     return;
@@ -2081,9 +2085,11 @@ app.get('/api/search', async (req, res) => {
                     site_key: site.key,
                     site_name: site.name
                 })) : [];
+                recordSiteHealth(site.key, true);
                 cacheManager.set('search', cacheKey, { list }, 3600);
                 allResults.push(...list);
             } catch (err) {
+                recordSiteHealth(site.key, false);
                 console.error(`[Search JSON] ${site.name}:`, err.message);
             }
         });
@@ -2134,7 +2140,10 @@ app.get('/api/search', async (req, res) => {
 
     // 并行搜索所有站点（关闭成人过滤时才包含黄果等 NSFW 扩展源）
     const searchSites = includeNsfw ? sites : sites.filter(s => !isNsfwSite(s));
-    const searchPromises = searchSites.map(async (site) => {
+    // ⚖️ 健康源优先：按历史健康度从高到低排序，健康源先请求先返回，坏源压到后面，
+    //    让"快速命中即播"(quickPlay/继续播放)更快拿到优质源，而不是先被慢/坏源拖住。
+    const rankedSites = [...searchSites].sort((a, b) => siteHealthScore(b.key) - siteHealthScore(a.key));
+    const searchPromises = rankedSites.map(async (site) => {
         // 对每个站点，尝试所有关键词变体
         const allResults = [];
 
@@ -2144,6 +2153,7 @@ app.get('/api/search', async (req, res) => {
 
             if (cached && cached.list) {
                 // 命中缓存
+                recordSiteHealth(site.key, true);
                 allResults.push(...cached.list);
             } else {
                 try {
@@ -2181,11 +2191,15 @@ app.get('/api/search', async (req, res) => {
                         })) : [];
                     }
 
+                    // 有结果记健康成功(哪怕0条也算连接成功)；无结果本轮可视为成功连接
+                    recordSiteHealth(site.key, true);
+
                     // 缓存结果 (1小时)
                     cacheManager.set('search', cacheKey, { list }, 3600);
 
                     allResults.push(...list);
                 } catch (error) {
+                    recordSiteHealth(site.key, false); // 搜索失败 = 该源当前不健康
                     // 单个关键词失败不影响其他
                     if (kw === searchKeywords[0]) {
                         console.error(`[SSE Search Error] ${site.name}:`, error.message);

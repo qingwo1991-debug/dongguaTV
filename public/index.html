@@ -5003,8 +5003,28 @@
                     this._quickPlayBusy = true;
                     if (this._evtSource) { this._evtSource.close(); this._evtSource = null; }
 
-                    const normalize = s => String(s || '').toLowerCase().replace(/[\s·:：—_\-（）()第季部]/g, '');
+                    // 匹配评分：标题归一化精确/包含匹配 + 可播性(有 play_url)加权。
+                    // 目标是"评分最高的源"而非"第一个到的源"；综合得分低的候选用 await 窗口吸收，
+                    // 高分源(精确匹配+可播)到就立即播。
+                    const normalize = s => String(s || '').toLowerCase().replace(/[\s·:：—_\-（）()第季部+]/g, '');
                     const targetNorm = normalize(name);
+                    const altNorm = originalTitle ? normalize(originalTitle) : '';
+                    const scoreOf = (x) => {
+                        if (!x || !x.vod_name) return 0;
+                        const n = normalize(x.vod_name);
+                        let base = 0;
+                        if (n === targetNorm) base = 100;
+                        else if (targetNorm && n.includes(targetNorm)) base = (targetNorm.length > 6 ? 92 : 85);
+                        else if (targetNorm && targetNorm.includes(n)) base = (n.length > 6 ? 90 : 80);
+                        if (base === 0 && altNorm) {
+                            if (n === altNorm) base = 95;
+                            else if (altNorm.includes(n) || n.includes(altNorm)) base = 75;
+                        }
+                        if (base === 0) return 0;
+                        if (x.vod_play_url) base += 12;          // 可播性加权
+                        if (this.isExtSiteKey(x.site_key)) base -= 5;  // 扩展源需后端解析，略降权
+                        return base;
+                    };
 
                     let url = `/api/search?wd=${encodeURIComponent(name)}&stream=true`;
                     if (originalTitle && originalTitle !== name) url += `&original=${encodeURIComponent(originalTitle)}`;
@@ -5012,43 +5032,85 @@
 
                     const es = new EventSource(url);
                     this._evtSource = es;
-                    let finished = false;
+                    let started = false;          // 已开播(流保留用于后台吞并联路)
+                    let finished = false;         // 整次操作结束(关闭流)
+                    let bestSoFar = null;         // { score, hit } 途中最高分
 
-                    const finish = (fallbackSearch) => {
+                    const stop = (fallbackSearch) => {
                         if (finished) return;
                         finished = true;
                         if (this._evtSource === es) this._evtSource = null;
                         try { es.close(); } catch (e) { }
                         this._quickPlayBusy = false;
-                        if (fallbackSearch) {
-                            console.log('[快速播放] 未在时限内命中，回退全量搜索');
+                        if (fallbackSearch && !started) {
+                            console.log('[快速播放] 未在时限内找到可播源，回退全量搜索');
                             this.autoSearch(name, originalTitle || '');
                         }
                     };
-                    // 3.5s 仍未命中 → 关闭并回退全量搜索(用户也可在搜索页看到已收集的全部结果)
-                    const timer = setTimeout(() => finish(true), 3500);
 
                     es.onmessage = (e) => {
                         if (finished) return;
                         try {
                             const batch = JSON.parse(e.data);
                             if (!Array.isArray(batch) || batch.length === 0) return;
-                            const hit = batch.find(x => {
-                                if (!x.vod_name) return false;
-                                const n = normalize(x.vod_name);
-                                const t = normalize(name);
-                                return n === t || n.includes(t) || t.includes(n);
-                            });
-                            if (!hit) return;
-                            console.log('[快速播放] 🎯 命中:', hit.site_name, '|', hit.vod_name);
-                            clearTimeout(timer);
-                            finish(false);
-                            const src = { ...hit, latency: 0 };
-                            this.openDetail({ name: hit.vod_name || name, pic: hit.vod_pic || '', sources: [src] });
+                            // 对每批打分，保留途中最高分候选
+                            for (const x of batch) {
+                                const s = scoreOf(x);
+                                if (s > 0 && (!bestSoFar || s > bestSoFar.score)) {
+                                    bestSoFar = { score: s, item: x };
+                                }
+                            }
+                            // 已开播：把新批的高分/未收录源吞并进 currentGroup，让换源/自动failover有备选
+                            if (started) {
+                                const cur = this.currentGroup;
+                                if (cur && Array.isArray(cur.sources)) {
+                                    const exist = new Set(cur.sources.map(s => s.site_key));
+                                    const merged = cur.sources.slice();
+                                    let added = 0;
+                                    for (const x of batch) {
+                                        const k = x.site_key || (x.site_name + '_' + x.vod_id);
+                                        if (scoreOf(x) >= 70 && !exist.has(k)) {
+                                            exist.add(k);
+                                            merged.push({ ...x, site_key: k, latency: 400 });
+                                            added++;
+                                        }
+                                    }
+                                    if (added > 0) {
+                                        this.currentGroup = { ...cur, sources: merged };
+                                        console.log('[快速播放] 后台并入线路:', added, '条(共', merged.length, '条)');
+                                    }
+                                }
+                                return;
+                            }
+
+                            // 未开播：任一批到达高分(精确/准精确)即可立即开播
+                            if (bestSoFar && bestSoFar.score >= 85) {
+                                const hit = bestSoFar.item;
+                                console.log('[快速播放] 🎯 高分命中:', hit.site_name, '|', hit.vod_name, '评分', bestSoFar.score);
+                                started = true;   // 开播后流保留继续吞并联路
+                                const src = { ...hit, site_key: hit.site_key || (hit.site_name + '_' + hit.vod_id), latency: 0 };
+                                this.openDetail({ name: hit.vod_name || name, pic: hit.vod_pic || '', sources: [src] });
+                            }
                         } catch (err) { }
                     };
+                    // 3.5s 还未开播：若有最好候选(哪怕 70+分)也先开播(先有能播的)，没有才回退全量搜索
+                    const timer = setTimeout(() => {
+                        if (!finished && !started && bestSoFar && bestSoFar.score >= 70) {
+                            const hit = bestSoFar.item;
+                            console.log('[快速播放] 时限到，用途中最佳候选开播:', hit.vod_name, '评分', bestSoFar.score);
+                            started = true;
+                            const src = { ...hit, site_key: hit.site_key || (hit.site_name + '_' + hit.vod_id), latency: 0 };
+                            this.openDetail({ name: hit.vod_name || name, pic: hit.vod_pic || '', sources: [src] });
+                            setTimeout(() => stop(false), 12000); // 继续收12s让后续源并入，之后关闭
+                        } else {
+                            stop(true);
+                        }
+                    }, 3500);
                     es.addEventListener('done', () => {
-                        if (!finished) { clearTimeout(timer); finish(true); }
+                        // 流结束：若已开播则停止；否则无结果回退
+                        setTimeout(() => {
+                            if (started) { stop(false); } else { stop(true); }
+                        }, 1200);
                     });
                 },
 
