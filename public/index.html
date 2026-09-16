@@ -3354,7 +3354,7 @@
                             切换线路
                             <span v-if="isTestingSources"
                                 style="font-size: 12px; color: #888; font-weight: normal; margin-left: 10px;">
-                                <i class="fas fa-spinner fa-spin"></i> 正在测速...
+                                <i class="fas fa-sync-alt fa-spin"></i> 后台测速中...
                             </span>
                             <span v-else @click="refreshSources"
                                 style="margin-left: 10px; font-size: 12px; color: #888; cursor: pointer; padding: 2px 8px; border-radius: 4px; border: 1px solid #444; transition: all 0.2s;"
@@ -5768,7 +5768,8 @@
                 },
 
                 // 顶部 TMDB 推荐只有元数据，没有本站 vod_id。后台聚合搜源后直接打开详情；
-                // 只有完全匹配不到可播线路时才回退到搜索结果页。
+                // 指哪打哪：能匹配到就直达播放页；匹配不到也直接进播放页让用户手动选线路，
+                // 只有全网完全搜不到时才回退到搜索结果页并提示。
                 async playRecommendation(item) {
                     if (!item || this.directOpeningTitle) return;
                     const title = item.title || '';
@@ -5792,23 +5793,45 @@
                             if (this.isExtSiteKey(source.site_key)) score += 2;
                             return { source, score };
                         }).filter(x => x.score > 0).sort((a, b) => b.score - a.score);
+
+                        // 1️⃣ 精确/模糊匹配成功：直达播放详情页（首选）
                         if (scored.length > 0) {
                             const bestName = scored[0].source.vod_name;
                             const bestNorm = normalize(bestName);
                             const sources = scored.filter(x => normalize(x.source.vod_name) === bestNorm).map(x => ({
                                 ...x.source,
-                                latency: 999,
+                                latency: 500,
                                 _isExt: this.isExtSiteKey(x.source.site_key)
                             }));
                             this.openDetail({ name: bestName, pic: scored[0].source.vod_pic || '', sources });
                             return;
                         }
+
+                        // 无精确匹配但搜到数据：仍是可播线路，直接进详情页让用户选线路，不再跳搜索页
+                        if (list.length > 0) {
+                            console.log('[推荐直达] 无精确匹配，搜集到 ' + list.length + ' 个候选，直接进播放页选线路');
+                            const sources = list.map(s => ({
+                                ...s,
+                                latency: 999,
+                                _isExt: this.isExtSiteKey(s.site_key)
+                            }));
+                            // 优先 name 相近的第一个
+                            const preferred = list.map(s => ({ s, n: normalize(s.vod_name) }))
+                                .find(x => targets.some(t => t.includes(x.n) || x.n.includes(t)));
+                            const picked = (preferred || { s: list[0] }).s;
+                            this.openDetail({ name: picked.vod_name || title, pic: picked.vod_pic || '', sources });
+                            return;
+                        }
+                        // 全网无结果：回退搜索页，给出明确反馈
+                        this.autoRetryMessage = '未找到《' + title + '》的可播线路，已进入搜索';
+                        setTimeout(() => { this.autoRetryMessage = ''; }, 3000);
+                        this.autoSearch(title, item.originalTitle || '');
                     } catch (e) {
                         console.warn('[推荐直达] 匹配失败，回退搜索:', e.message);
+                        this.autoSearch(title, item.originalTitle || '');
                     } finally {
                         this.directOpeningTitle = '';
                     }
-                    this.autoSearch(title, item.originalTitle || '');
                 },
                 isExtSiteKey(key) {
                     if (!key) return false;
@@ -5977,19 +6000,32 @@
                         return;
                     }
 
+                    // 🎯 指哪打哪：不再"先测速再开播"。先拿延迟最低的/第一个线路立刻开播，
+                    //    测速转为后台偷偷进行（下方 latencyPromises 不阻塞播放），测完自动优源。
+                    if (group.sources.length > 0) {
+                        const quickestCandidate = group.sources
+                            .slice()
+                            .sort((a, b) => (typeof a.latency === 'number' ? a.latency : 999) - (typeof b.latency === 'number' ? b.latency : 999))[0];
+                        this.switchSource(quickestCandidate);
+                    }
+
                     // 真实用户端测速：获取每个线路的视频URL，直接从用户端测试m3u8延迟
                     // 这样能真正反映用户是否可以访问该视频源
 
-                    // 快速返回标志：一旦有2+快速线路，立即自动选择最快的
+                    // 快速返回标志：一旦有2+快速线路，立即自动选择最快的（仅当尚未真正开播时, 已开播不打扰）
                     let hasAutoSelected = false;
                     const FAST_THRESHOLD = 600;  // 快速线路阈值 (ms)
                     const EARLY_RETURN_COUNT = 2;  // 有几个快速线路后提前返回
                     const MAX_WAIT_TIME = 3000;  // 最长等待时间 (ms)
 
+                    // 已真正开播（有 URL 且在 loading，或播放器已收到 URL）则后台测速只做展示，不再抢切
+                    const userAlreadyStarted = () => !!(this.currentSource && this.currentUrl);
+
                     // 检查是否可以提前返回 - 优先用户端测速结果
                     const checkEarlyReturn = () => {
                         if (_openSeq !== _navSeq) return;  // 🧭 已切换到别的剧，停止自动选源
                         if (hasAutoSelected) return;
+                        if (userAlreadyStarted()) return;  // 🎯 已开播，后台测速仅更新延迟，不自动抢源
 
                         // 优先检查用户端测速(direct)的快速线路
                         const directFastSources = this.currentGroup.sources.filter(s =>
@@ -6004,11 +6040,16 @@
                         }
                     };
 
-                    // 超时自动选择（优先用户端测速，其次服务器端）
+                    // 超时自动选择（仅当尚未开播时；若已开播则静默沿用当前线路）
                     const earlyReturnTimer = setTimeout(() => {
                         if (_openSeq !== _navSeq) return;  // 🧭 已切换到别的剧，放弃超时自动选源
                         if (hasAutoSelected) return;
                         hasAutoSelected = true;
+                        if (userAlreadyStarted()) {
+                            // 🎯 已开播：只接收测速结果并更新延迟显示，不再切换打断
+                            console.log('[超时返回] 已开播，保留当前线路，后台测速结果静默可用');
+                            return;
+                        }
 
                         // 优先选择用户端测速的结果
                         let directSources = this.currentGroup.sources.filter(s =>
@@ -6210,49 +6251,56 @@
                         return source;
                     });
 
-                    // 等待所有测速完成（后台继续）
-                    await Promise.all(latencyPromises);
-                    clearTimeout(earlyReturnTimer);
-                    // 🧭 测速期间用户可能已切换到别的剧（此时 isTestingSources 归 B 所有），丢弃本次结果
-                    if (_openSeq !== _navSeq) return;
-                    this.isTestingSources = false;  // 测速完成
+                    // 🎯 后台偷偷测速：不阻塞播放器。点开详情后已立即开播（见上方 switchSource），
+                    //    这里测速只更新各线路延迟排序；仅当"还没真正开播"或"当前线路失败"时自动优源，
+                    //    已开播时绝不打断用户正在看的内容。
+                    Promise.all(latencyPromises).then(() => {
+                        clearTimeout(earlyReturnTimer);
+                        // 🧭 测速期间用户可能已切换到别的剧（此时 isTestingSources 归 B 所有），丢弃本次结果
+                        if (_openSeq !== _navSeq) return;
+                        this.isTestingSources = false;  // 测速完成
 
-                    // 按延迟排序 (低到高)
-                    this.currentGroup.sources.sort((a, b) => {
-                        const latA = typeof a.latency === 'number' ? a.latency : 9999;
-                        const latB = typeof b.latency === 'number' ? b.latency : 9999;
-                        return latA - latB;
-                    });
+                        // 按延迟排序 (低到高)
+                        this.currentGroup.sources.sort((a, b) => {
+                            const latA = typeof a.latency === 'number' ? a.latency : 9999;
+                            const latB = typeof b.latency === 'number' ? b.latency : 9999;
+                            return latA - latB;
+                        });
 
-                    // 如果已经有选中的源并且视频已开始播放，不再自动切换
-                    // 这样不会打断用户正在观看的内容
-                    if (hasAutoSelected && this.currentSource && this.currentUrl) {
-                        console.log(`[测速完成] 保持当前线路: ${this.currentSource.site_name}，不自动切换`);
-                        return;
-                    }
+                        // 已经真正开播的（有 currentUrl）：只更新延迟展示，不再切换
+                        // 这样"指哪打哪"——点开即播，测速在后台跑，既不卡顿也不打断
+                        if (userAlreadyStarted()) {
+                            console.log(`[后台测速] 已开播，保持当前线路: ${this.currentSource.site_name}，静默更新 ${this.currentGroup.sources.length} 条延迟`);
+                            return;
+                        }
 
-                    // 如果还没有选择任何源，选择最快的
-                    if (!hasAutoSelected) {
-                        // 优先选择用户端测速(direct)的结果
-                        const directSources = this.currentGroup.sources.filter(s =>
-                            s._testType === 'direct' && typeof s.latency === 'number' && s.latency < 9000
-                        );
-
-                        if (directSources.length > 0) {
-                            console.log(`[测速完成] 选择用户端测速最快的线路: ${directSources[0].site_name} (${directSources[0].latency}ms)`);
-                            this.switchSource(directSources[0]);
-                        } else {
-                            // 回退到服务器端测速最快的
-                            const fastestAvailable = this.currentGroup.sources.find(s =>
-                                typeof s.latency === 'number' && s.latency < 9000
+                        // 还没真正开播（例如默认线路解析失败）：用测速结果自动优源
+                        if (!hasAutoSelected) {
+                            // 优先选择用户端测速(direct)的结果
+                            const directSources = this.currentGroup.sources.filter(s =>
+                                s._testType === 'direct' && typeof s.latency === 'number' && s.latency < 9000
                             );
-                            if (fastestAvailable) {
-                                console.log(`[测速完成] 选择服务器测速最快的线路: ${fastestAvailable.site_name} (${fastestAvailable.latency}ms)`);
-                                this.switchSource(fastestAvailable);
+
+                            if (directSources.length > 0) {
+                                console.log(`[测速完成] 选择用户端测速最快的线路: ${directSources[0].site_name} (${directSources[0].latency}ms)`);
+                                this.switchSource(directSources[0]);
+                            } else {
+                                // 回退到服务器端测速最快的
+                                const fastestAvailable = this.currentGroup.sources.find(s =>
+                                    typeof s.latency === 'number' && s.latency < 9000
+                                );
+                                if (fastestAvailable) {
+                                    console.log(`[测速完成] 选择服务器测速最快的线路: ${fastestAvailable.site_name} (${fastestAvailable.latency}ms)`);
+                                    this.switchSource(fastestAvailable);
+                                }
                             }
                         }
-                    }
-                    // 如果全部不可用，不自动选择，UI会显示提示
+                        // 如果全部不可用，不自动选择，UI会显示提示
+                    }).catch(e => {
+                        console.warn('[后台测速] 异常:', e);
+                        clearTimeout(earlyReturnTimer);
+                        this.isTestingSources = false;
+                    });
                 },
                 closeDetail() {
                     this.showDetail = false;
