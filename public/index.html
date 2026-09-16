@@ -5749,6 +5749,8 @@
                             if (this.rowLists[key].length) filled.push(key);
                         });
                         console.log(`[P0-1] /api/home 聚合首屏: 填充 ${filled.length} 行:`, filled.join(', '));
+                        // 🎯 热门预取：每行前几部热门卡在空闲期后台预取详情，用户点开即秒开
+                        this.prefetchHotCards(filled);
                         return filled;
                     } catch (e) {
                         console.warn('[Home-Aggregate] 聚合失败，回退逐行加载:', e.message);
@@ -6017,6 +6019,35 @@
                     const key = String(item.site_key || '').toLowerCase();
                     const name = String(item.site_name || '');
                     return key === 'huangguo' || name === '黄果短剧';
+                },
+
+                // 🎯 热门预取：聚合首屏每行的前 N 部热门卡，在页面空闲期后台预取详情(复用 prefetchExtCard)，
+                //    用户点击首屏热门剧时服务端已有缓存 → 真正秒开。限流避免几十个请求打爆代理。
+                prefetchHotCards(filledKeys) {
+                    try {
+                        if ('requestIdleCallback' in window) {
+                            requestIdleCallback(() => this._doPrefetchHot(filledKeys), { timeout: 4000 });
+                        } else {
+                            setTimeout(() => this._doPrefetchHot(filledKeys), 1200);
+                        }
+                    } catch (e) { }
+                },
+                _doPrefetchHot(filledKeys) {
+                    if (!Array.isArray(filledKeys)) return;
+                    let count = 0;
+                    const MAX = 10; // 每轮最多预热 10 部，避免过多请求
+                    for (const key of filledKeys) {
+                        const items = this.rowLists[key] || [];
+                        for (const it of items.slice(0, 2)) { // 每行前 2 部
+                            if (count >= MAX) break;
+                            if (it && it.site_key && it.vod_id) {
+                                this.prefetchExtCard(it);
+                                count++;
+                            }
+                        }
+                        if (count >= MAX) break;
+                    }
+                    console.log(`[热门预取] 预热 ${count} 部热门剧集详情`);
                 },
 
                 // 鼠标悬停/触摸按下时静默预取扩展详情；用户真正点击时通常已命中服务端缓存。

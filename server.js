@@ -547,6 +547,37 @@ class CacheManager {
         this.detailCache = {};
         this.db = null;
         this.init();
+        // 📈 命中频次跟踪：用于热门自适应 TTL（反复访问的剧/源自动延长缓存寿命）
+        this._hits = new Map(); // key: `${category}:${key}` → count
+    }
+
+    // 🎯 热门自适应：命中时累计热度，热度到阈值就把该条缓存寿命延长。
+    //    冷门条目标 minute 就过期，热门条目反复被看时持续续命——命中率上升，坏源重新拉取降频。
+    _trackHit(category, key) {
+        try {
+            const k = `${category}:${key}`;
+            const c = (this._hits.get(k) || 0) + 1;
+            this._hits.set(k, c);
+            if (this._hits.size > 4000) {
+                const drop = [...this._hits.keys()].slice(0, 800);
+                drop.forEach(dk => this._hits.delete(dk));
+            }
+            // 热度达到阈值时，把该条目的过期时间向后刷新（热门续命）
+            if (this.type === 'sqlite' && this.db && c >= 3) {
+                const row = this.db.prepare(
+                    'SELECT expire FROM cache WHERE category = ? AND key = ?'
+                ).get(category, key);
+                if (row) {
+                    const remain = row.expire - Date.now();
+                    if (remain < 1800 * 1000) {  // 剩余不足 30 分钟才续，避免无意义抖动
+                        const extendSec = c >= 12 ? 7200 : c >= 6 ? 3600 : 1800;
+                        this.db.prepare(
+                            'UPDATE cache SET expire = ? WHERE category = ? AND key = ?'
+                        ).run(Date.now() + extendSec * 1000, category, key);
+                    }
+                }
+            }
+        } catch (e) { }
     }
 
     init() {
@@ -610,18 +641,19 @@ class CacheManager {
     get(category, key) {
         if (this.type === 'memory') {
             const data = category === 'search' ? this.searchCache[key] : this.detailCache[key];
-            if (data && data.expire > Date.now()) return data.value;
+            if (data && data.expire > Date.now()) { this._trackHit(category, key); return data.value; }
             return null;
         } else if (this.type === 'json') {
             const data = category === 'search' ? this.searchCache[key] : this.detailCache[key];
-            if (data && data.expire > Date.now()) return data.value;
+            if (data && data.expire > Date.now()) { this._trackHit(category, key); return data.value; }
             return null;
         } else if (this.type === 'sqlite' && this.db) {
             try {
                 const row = this.db.prepare(
                     'SELECT value FROM cache WHERE category = ? AND key = ? AND expire > ?'
                 ).get(category, key, Date.now());
-                return row ? JSON.parse(row.value) : null;
+                if (row) { this._trackHit(category, key); return JSON.parse(row.value); }
+                return null;
             } catch (e) {
                 console.error('[SQLite Cache] Get error:', e.message);
                 return null;
@@ -661,13 +693,38 @@ class CacheManager {
         }
     }
 
-    // 定期清理过期缓存 (SQLite)
+    // 定期清理过期缓存 + 软上限逐出 (SQLite)
+    // 智能淘汰：除删除过期条目外，每类缓存设置软上限，超出时按"到期时间最远→最久未用"优先淘汰，
+    // 防止 DB 无限膨胀（尤其 search/detail 长期累积），同时热门条目因 TTL 续命而天然保留更久。
     cleanup() {
         if (this.type === 'sqlite' && this.db) {
             try {
                 const result = this.db.prepare('DELETE FROM cache WHERE expire < ?').run(Date.now());
                 if (result.changes > 0) {
                     console.log(`[SQLite Cache] Cleaned ${result.changes} expired entries`);
+                }
+                // 软上限：按类别逐出超量条目（最久未过期 / 最小评估保留价值优先淘汰）
+                const limits = { detail: 8000, search: 6000, ext_media: 3000 };
+                for (const [cat, limit] of Object.entries(limits)) {
+                    try {
+                        const row = this.db.prepare(
+                            'SELECT COUNT(*) AS c FROM cache WHERE category = ?'
+                        ).get(cat);
+                        if (row && row.c > limit) {
+                            const over = row.c - limit;
+                            const removed = this.db.prepare(`
+                                DELETE FROM cache WHERE category = ? AND key IN (
+                                    SELECT key FROM cache WHERE category = ?
+                                    ORDER BY expire ASC LIMIT ?
+                                )
+                            `).run(cat, cat, over);
+                            if (removed.changes > 0) {
+                                console.log(`[SQLite Cache] 软上限淘汰 ${cat}: 移除 ${removed.changes} 条(现 ${row.c - removed.changes} 条, 上限 ${limit})`);
+                            }
+                        }
+                    } catch (e) {
+                        console.error(`[SQLite Cache] 软上限淘汰(${cat}) error:`, e.message);
+                    }
                 }
             } catch (e) {
                 console.error('[SQLite Cache] Cleanup error:', e.message);
