@@ -6227,10 +6227,18 @@
 
                     // 🎯 指哪打哪：不再"先测速再开播"。先拿延迟最低的/第一个线路立刻开播，
                     //    测速转为后台偷偷进行（下方 latencyPromises 不阻塞播放），测完自动优源。
+                    //    🎬 可播性优先：自带 vod_play_url 的源(无需再拉 detail 解析)永远排最前，
+                    //    直接 switchSource 命中 vod_play_url 分支秒播；否则才按 latency 排序。
                     if (group.sources.length > 0) {
                         const quickestCandidate = group.sources
                             .slice()
-                            .sort((a, b) => (typeof a.latency === 'number' ? a.latency : 999) - (typeof b.latency === 'number' ? b.latency : 999))[0];
+                            .sort((a, b) => {
+                                const pa = !!a.vod_play_url ? 0 : 1;  // 自带地址优先(维度1)
+                                const pb = !!b.vod_play_url ? 0 : 1;
+                                if (pa !== pb) return pa - pb;
+                                return (typeof a.latency === 'number' ? a.latency : 999)
+                                    - (typeof b.latency === 'number' ? b.latency : 999);
+                            })[0];
                         this.switchSource(quickestCandidate);
                     }
 

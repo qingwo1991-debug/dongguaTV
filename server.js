@@ -1853,6 +1853,44 @@ function siteHealthRows(rows) {
     });
 }
 
+// ========== 🔥 搜索热词 TTL ==========
+// 统计每个搜索词在滚动窗口内的请求热度。热门词(≥3 次)的搜索缓存 TTL 翻倍：
+// 反正反复有人搜,缓存保持更久命中率更高、源站压力更小；冷门词照常 1h 过期不占空间。
+// 注：仅按"词频"计热，与站点无关(热词全域通用)。
+const searchTermHits = new Map(); // 词(归一化小写) → 最近 hits 数
+function recordSearchTerm(rawKw) {
+    try {
+        const k = String(rawKw || '').trim().toLowerCase().slice(0, 40);
+        if (!k) return;
+        const cur = (searchTermHits.get(k) || 0) + 1;
+        searchTermHits.set(k, cur);
+        // 🔥 刚跨过热词门槛(≥3) → 立即把该词所有站点的 search 缓存 TTL 延长到 7200s。
+        //    否则热词第3次请求若命中缓存就不会重新 set, TTL 永远停在首次的 3600s。
+        if (cur === 3 && cacheManager && cacheManager.type === 'sqlite' && cacheManager.db) {
+            try {
+                const like = `%${k}`;  // cacheKey 形如 <site>_<word>
+                const res = cacheManager.db.prepare(
+                    'UPDATE cache SET expire = ? WHERE category = ? AND key LIKE ? AND expire < ?'
+                ).run(Date.now() + 7200 * 1000, 'search', like, Date.now() + 3600 * 1000);
+                if (res.changes > 0) {
+                    console.log(`[热词] '${k}' 成为热词, ${res.changes} 条搜索缓存 TTL 翻倍至 2h`);
+                }
+            } catch (e) { }
+        }
+        if (searchTermHits.size > 500) {  // 只保留最活跃的词，防 Map 无限涨
+            const oldest = [...searchTermHits.entries()].sort((a, b) => a[1] - b[1])[0];
+            if (oldest) searchTermHits.delete(oldest[0]);
+        }
+        return cur;
+    } catch (e) { return 0; }
+}
+// 返回该词的 search 缓存 TTL：热词翻倍(7200s)，冷门 3600s
+function searchTTL(keyword) {
+    const k = String(keyword || '').trim().toLowerCase().slice(0, 40);
+    const hits = searchTermHits.get(k) || 0;
+    return hits >= 3 ? 7200 : 3600;
+}
+
 // ========== P0-1 首页聚合接口 /api/home ==========
 // 一次并行返回 hero + 前 N 行榜单，把首页打开从 N 次串行请求降为 1 次。
 // 前端渐进式使用：拿到即填充首屏(其余行仍按原逐行补拉)；接口失败/超时前端自动回退逐行。
@@ -2099,6 +2137,10 @@ app.get('/api/search', async (req, res) => {
         return res.status(400).json({ error: 'Missing keyword' });
     }
 
+    // 🔥 热词统计：用户发起任一搜索(无论命中缓存/站内多站点)均计热一次。放在缓存 miss/set 更准——
+    //    否则同一词命中缓存后不再计次, 热度永远起不来。
+    recordSearchTerm(keyword);
+
     const sites = getDB().sites;
     const includeNsfw = truthyFlag(req.query.include_nsfw);
 
@@ -2128,7 +2170,7 @@ app.get('/api/search', async (req, res) => {
                     // XPTV js 扩展源: 调用 search()
                     const extList = await extSearch(site, keyword);
                     recordSiteHealth(site.key, true);
-                    cacheManager.set('search', cacheKey, { list: extList }, 3600);
+                    cacheManager.set('search', cacheKey, { list: extList }, searchTTL(keyword));
                     allResults.push(...(extList.map(item => ({ ...item, site_key: site.key, site_name: site.name }))));
                     return;
                 }
@@ -2143,7 +2185,7 @@ app.get('/api/search', async (req, res) => {
                     site_name: site.name
                 })) : [];
                 recordSiteHealth(site.key, true);
-                cacheManager.set('search', cacheKey, { list }, 3600);
+                cacheManager.set('search', cacheKey, { list }, searchTTL(keyword));
                 allResults.push(...list);
             } catch (err) {
                 recordSiteHealth(site.key, false);
@@ -2251,8 +2293,8 @@ app.get('/api/search', async (req, res) => {
                     // 有结果记健康成功(哪怕0条也算连接成功)；无结果本轮可视为成功连接
                     recordSiteHealth(site.key, true);
 
-                    // 缓存结果 (1小时)
-                    cacheManager.set('search', cacheKey, { list }, 3600);
+                    // 缓存结果 (热词翻倍 TTL)
+                    cacheManager.set('search', cacheKey, { list }, searchTTL(kw));
 
                     allResults.push(...list);
                 } catch (error) {
@@ -2328,7 +2370,7 @@ app.post('/api/search', async (req, res) => {
         if (isExtSite(site)) {
             const extList = await extSearch(site, keyword);
             const result = { list: extList };
-            cacheManager.set('search', cacheKey, result, 3600);
+            cacheManager.set('search', cacheKey, result, searchTTL(keyword));
             return res.json(result);
         }
 
@@ -2348,7 +2390,7 @@ app.post('/api/search', async (req, res) => {
             })) : []
         };
 
-        cacheManager.set('search', cacheKey, result, 3600); // 缓存1小时
+        cacheManager.set('search', cacheKey, result, searchTTL(keyword)); // 热词翻倍 TTL
         res.json(result);
     } catch (error) {
         console.error(`[Search Error] ${site.name}:`, error.message);
