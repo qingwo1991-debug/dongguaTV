@@ -1329,6 +1329,20 @@ const extResolveInflight = new Map();
 const extManifestCache = new Map();
 const EXT_MANIFEST_CACHE_TTL = 120000;
 
+// 🧊 P0-2 磁盘化播放缓存：内存 Map 只作热层，冷数据走 SQLite(cache.db, 重启不冷)。
+// 仅当缓存类型为 sqlite/json 且非 Vercel Serverless 时启用（内存/无 模式跳过）。
+const EXT_DISK_CACHE_ENABLED = !process.env.VERCEL && (CACHE_TYPE === 'sqlite' || CACHE_TYPE === 'json');
+const EXT_DISK_CACHE_TTL_SEC = 900; // 15 分钟，与内存 playinfo TTL 对齐
+
+function getDiskExt(key) {
+    if (!EXT_DISK_CACHE_ENABLED || !cacheManager) return null;
+    try { return cacheManager.get('ext_media', key); } catch (e) { return null; }
+}
+function setDiskExt(key, value) {
+    if (!EXT_DISK_CACHE_ENABLED || !cacheManager) return;
+    try { cacheManager.set('ext_media', key, value, EXT_DISK_CACHE_TTL); } catch (e) { }
+}
+
 function getCachedExtManifest(url) {
     const item = extManifestCache.get(url);
     if (!item) return null;
@@ -1341,7 +1355,18 @@ function getCachedExtManifest(url) {
 function setCachedExtManifest(url, text) {
     if (!url || !text) return;
     extManifestCache.set(url, { text, time: Date.now() });
+    setDiskExt('m:' + url, { k: 'm', text }); // 落盘（重启不冷）
     if (extManifestCache.size > 300) extManifestCache.delete(extManifestCache.keys().next().value);
+}
+function getCachedExtManifestCold(url) {
+    const hot = getCachedExtManifest(url);
+    if (hot) return hot;
+    const cold = getDiskExt('m:' + url);
+    if (cold && cold.k === 'manifest' && typeof cold.text === 'string') {
+        setCachedExtManifest(url, cold.text);
+        return cold.text;
+    }
+    return null;
 }
 function getCachedExtPlayinfo(url) {
     const item = extPlayinfoCache.get(url);
@@ -1355,15 +1380,27 @@ function getCachedExtPlayinfo(url) {
 function setCachedExtPlayinfo(url, m3u8) {
     if (url && m3u8) {
         extPlayinfoCache.set(url, { m3u8, time: Date.now() });
+        setDiskExt('p:' + url, { k: 'playinfo', m3u8 }); // 落盘（重启不冷）
         if (extPlayinfoCache.size > 500) {
             const firstKey = extPlayinfoCache.keys().next().value;
             extPlayinfoCache.delete(firstKey);
         }
     }
 }
+function getCachedExtPlayinfoCold(url) {
+    const hot = getCachedExtPlayinfo(url);
+    if (hot) return hot;
+    const cold = getDiskExt('p:' + url);
+    if (cold && cold.k === 'playinfo' && /^https?:\/\//i.test(String(cold.m3u8))) {
+        setCachedExtPlayinfo(url, cold.m3u8);
+        return cold.m3u8;
+    }
+    return null;
+}
 
+// 扩展源单集播放直链解析：优先内存热层，冷读可走 SQLite 磁盘恢复，inflight 去重防并发重复解析。
 async function resolveExtMediaUrl(site, rawUrl, playArgs = {}) {
-    const cached = getCachedExtPlayinfo(rawUrl);
+    const cached = getCachedExtPlayinfoCold(rawUrl);
     if (cached) return { url: cached, cached: true };
 
     let promise = extResolveInflight.get(rawUrl);
@@ -1401,7 +1438,7 @@ app.get('/api/ext/resolve-play', async (req, res) => {
         return res.status(400).json({ error: 'Invalid resolve request' });
     }
 
-    const cached = getCachedExtPlayinfo(rawUrl);
+    const cached = getCachedExtPlayinfoCold(rawUrl);
     if (cached) {
         return res.json({ url: cached, type: /\.mp4(?:[?#]|$)/i.test(cached) ? 'auto' : 'hls', cached: true });
     }
@@ -1428,7 +1465,7 @@ app.get(['/api/ext-hls-proxy', '/api/ext-hls-proxy/:resource'], async (req, res)
     try {
         // 如果传入的是视频播放页面 URL (例如 https://huangguoai.com/video/3444/ep-2/)，动态解析其 m3u8 直链
         if (!rawUrl.includes('.m3u8') && !rawUrl.endsWith('.ts') && !rawUrl.endsWith('.key')) {
-            const cachedM3u8 = getCachedExtPlayinfo(rawUrl);
+            const cachedM3u8 = getCachedExtPlayinfoCold(rawUrl);
             if (cachedM3u8) {
                 rawUrl = cachedM3u8;
             } else {
@@ -1462,7 +1499,7 @@ app.get(['/api/ext-hls-proxy', '/api/ext-hls-proxy/:resource'], async (req, res)
     const isManifest = parsedUpstream.pathname.toLowerCase().includes('.m3u8');
 
     if (isManifest) {
-        const cachedManifest = getCachedExtManifest(upstreamUrl);
+        const cachedManifest = getCachedExtManifestCold(upstreamUrl);
         if (cachedManifest) {
             res.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
             res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
@@ -1671,6 +1708,9 @@ app.get('/api/ext/cards', async (req, res) => {
         const data = { results, total_pages: 5, page, route: routeUsed };
         if (results.length > 0) {
             cacheManager.set('detail', cacheKey, data, 300); // 推荐列表缓存 5 分钟，兼顾实时更新与加载速度
+            recordSiteHealth(siteKey, true);
+        } else {
+            recordSiteHealth(siteKey, false);
         }
 
         // 🚀 首页主卡后台并行预热：前 6 部同时缓存首集媒体直链，其余只缓存结构。
@@ -1705,10 +1745,221 @@ app.get('/api/ext/cards', async (req, res) => {
 
         res.json(data);
     } catch (err) {
+        recordSiteHealth(siteKey, false);
         console.error(`[Ext Cards Error] ${site.name}:`, err.message);
         res.status(500).json({ error: 'Failed to fetch cards', results: [] });
     }
 });
+
+// ========== P3 站点健康度（首页自适应排序） ==========
+// 内存级轻量统计：记录每次 getCards 成功/失败，首页聚合按健康分排序，
+// 慢源/故障源自动后置，健康/热门前置。带时间衰减 + 封顶防无限增长。
+const siteHealth = new Map(); // key → { ok, total, lastOk, lastFail, updatedAt }
+function recordSiteHealth(siteKey, ok) {
+    try {
+        const k = String(siteKey || '').toLowerCase();
+        if (!k) return;
+        const h = siteHealth.get(k) || { ok: 0, total: 0, lastOk: 0, lastFail: 0, updatedAt: 0 };
+        h.total++;
+        if (ok) {
+            h.ok++;
+            h.lastOk = Date.now();
+            const dropRatio = h.total > 40 ? 0.9 : 1; // 长期衰减旧样本，保持对近期波动的敏感
+            h.ok = Math.round(h.ok * dropRatio);
+            h.total = Math.round(h.total * dropRatio);
+        } else {
+            h.lastFail = Date.now();
+        }
+        h.updatedAt = Date.now();
+        siteHealth.set(k, h);
+        if (siteHealth.size > 200) {
+            const oldest = [...siteHealth.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0];
+            if (oldest) siteHealth.delete(oldest[0]);
+        }
+    } catch (e) { }
+}
+function siteHealthScore(siteKey) {
+    const h = siteHealth.get(String(siteKey || '').toLowerCase());
+    if (!h || !h.total) return 50;
+    const base = (h.ok / h.total) * 100;
+    const recentPenalty = h.lastFail > h.lastOk ? 15 : 0;
+    return Math.max(0, base - recentPenalty);
+}
+function siteHealthRows(rows) {
+    // rows: [{key, results}] ；EXT 行按来源站点健康度排序，健康者在前；非 EXT 行保底排最前。
+    return [...rows].sort((a, b) => {
+        const ta = HOME_EXT_TARGETS[a.key];
+        const tb = HOME_EXT_TARGETS[b.key];
+        if (!tb) return -1;
+        if (!ta) return 1;
+        return siteHealthScore(tb[0]) - siteHealthScore(ta[0]);
+    });
+}
+
+// ========== P0-1 首页聚合接口 /api/home ==========
+// 一次并行返回 hero + 前 N 行榜单，把首页打开从 N 次串行请求降为 1 次。
+// 前端渐进式使用：拿到即填充首屏(其余行仍按原逐行补拉)；接口失败/超时前端自动回退逐行。
+// 单行失败只把该行留空，不影响其它行；整包 90s 缓存分担多用户并发。
+const HOME_ROW_KEYS = [
+    'huangguoRow', 'kuaikawRow', 'ageRow', 'ppnixRow', 'bde4Row', 'zxzjRow',
+    'libvioRow', 'aiRow', 'dubokuRow'
+];
+// EXT 行 → (site_key, tab)
+const HOME_EXT_TARGETS = {
+    huangguoRow: ['huangguo', 'home'], kuaikawRow: ['kuaikaw', 'home'], ageRow: ['age', 'home'],
+    ppnixRow: ['ppnix', 'home'], bde4Row: ['bde4', 'home'], zxzjRow: ['Zxzj', 'home'],
+    libvioRow: ['libvio', 'home'], aiRow: ['ai', 'home'], dubokuRow: ['duboku', 'home']
+};
+
+async function homeFetchTmdb(path, page = 1) {
+    const TMDB_API_KEY = process.env.TMDB_API_KEY;
+    if (!TMDB_API_KEY) return null;
+    const cacheKey = `tmdb_proxy_${path}_${page}`;
+    const cached = cacheManager.get('detail', cacheKey);
+    if (cached) return cached;
+    try {
+        const finalUrl = `https://api.themoviedb.org/3${path}`;
+        const response = await axios.get(finalUrl, {
+            params: { page, api_key: TMDB_API_KEY, language: 'zh-CN' },
+            timeout: 12000
+        });
+        cacheManager.set('detail', cacheKey, response.data, 3600);
+        return response.data;
+    } catch (e) {
+        console.warn(`[Home] TMDB fetch failed ${path}:`, e.message);
+        return null;
+    }
+}
+
+async function homeGetExtCards(siteKey, tab) {
+    const sites = getDB().sites;
+    const site = sites.find(s => s.key === siteKey && isExtSite(s));
+    if (!site) return [];
+    const cacheKey = `ext_cards_${siteKey}_${tab}_1`;
+    const cached = cacheManager.get('detail', cacheKey);
+    if (cached && Array.isArray(cached.results)) {
+        return cached.results.slice(0, 10);
+    }
+    try {
+        let tabArg = { id: tab, page: 1 };
+        if (tab === 'home') {
+            const cfg = await runExtJs(site, 'getConfig', {}, {}).catch(() => null);
+            if (cfg && cfg.tabs && cfg.tabs.length) {
+                const nonFilter = cfg.tabs.find(t => !t.ext || t.ext.type !== 'filter') || cfg.tabs[0];
+                tabArg = { ...(nonFilter.ext || { id: nonFilter.id || 'home' }), page: 1 };
+            }
+        }
+        const r = await runExtJs(site, 'getCards', tabArg, {});
+        if (r && Array.isArray(r.list)) {
+            let items = r.list;
+            if (items.length > 0) recordSiteHealth(siteKey, true); else recordSiteHealth(siteKey, false);
+            const results = items.map(item => {
+                const id = String(item.vod_id || item.id || item.ext?.id || '');
+                const name = item.vod_name || item.name || item.title || '';
+                const remarks = String(item.vod_remarks || item.remarks || item.subTitle || '').replace(/<[^>]+>/g, '').trim();
+                const scoreMatch = remarks.match(/([\d\.]+)分/);
+                const score = scoreMatch ? parseFloat(scoreMatch[1]) : 8.8;
+                return {
+                    id: `ext_${siteKey}_${id}`, vod_id: id, title: name, name: name,
+                    original_title: '', original_name: '',
+                    poster_path: item.vod_pic || item.pic || item.cover || item.poster || '',
+                    detail_url: item.ext?.url || item.ext?.play_url || '',
+                    vote_average: score, release_date: remarks || '精选',
+                    first_air_date: remarks || '精选', remarks: remarks,
+                    site_key: siteKey, site_name: site.name
+                };
+            });
+            const data = { results, total_pages: 5, page: 1, route: 'auto' };
+            if (results.length > 0) cacheManager.set('detail', `ext_cards_${siteKey}_${tab}_1`, data, 300);
+            return results.slice(0, 10);
+        }
+        return [];
+    } catch (e) {
+        recordSiteHealth(siteKey, false);
+        console.warn(`[HOME] ext cards failed ${siteKey}/${tab}:`, e.message);
+        return [];
+    }
+}
+
+app.get('/api/home', async (req, res) => {
+    try {
+        const cacheKey = 'home_aggregate_v1';
+        const cached = cacheManager.get('detail', cacheKey);
+        if (cached) return res.json(cached);
+
+        // hero：TMDB 热门（复用前端 fetchHero 相同源）
+        const [heroData, ...rowDatas] = await Promise.all([
+            homeFetchTmdb('/trending/all/week', 1),
+            ...HOME_ROW_KEYS.map(k => homeGetExtCards(HOME_EXT_TARGETS[k] ? HOME_EXT_TARGETS[k][0] : 'huangguo', HOME_EXT_TARGETS[k] ? HOME_EXT_TARGETS[k][1] : 'home'))
+        ]);
+
+        const hero = (heroData && Array.isArray(heroData.results))
+            ? heroData.results.filter(i => i.backdrop_path).slice(0, 5).map(item => ({
+                title: item.title || item.name,
+                originalTitle: item.original_title || item.original_name || '',
+                overview: item.overview || '精彩内容不容错过',
+                backdrop: item.backdrop_path,
+                poster: item.poster_path || '',
+                rawData: item
+            }))
+            : [];
+
+        const rows = HOME_ROW_KEYS.map((key, idx) => ({
+            key,
+            results: (rowDatas[idx] || []).slice(0, 10)
+        }));
+
+        // P3: 前端按服务端返回顺序渲染，这里已按健康度排序（健康源前置）
+        const payload = { hero, rows: siteHealthRows(rows), sorted: true, updatedAt: Date.now() };
+        cacheManager.set('detail', cacheKey, payload, 90);
+        res.json(payload);
+    } catch (err) {
+        console.error('[HOME] Aggregate error:', err.message);
+        res.status(502).json({ error: 'Home aggregate failed', hero: [], rows: [] });
+    }
+});
+
+// ========== P0-3 启动预热：重启后立即并行预热首页各源结构+首卡，配合磁盘缓存“重启不冷” ==========
+async function startupWarmup() {
+    try {
+        console.log('[P0-3] 启动预热开始 (HOME rows 前台 + 扩展源后台)...');
+        const keys = Object.keys(HOME_EXT_TARGETS);
+        await Promise.allSettled(keys.map(async (k) => {
+            const [siteKey, tab] = HOME_EXT_TARGETS[k];
+            try { await homeGetExtCards(siteKey, tab); } catch (e) { }
+        }));
+        // 顺手构建聚合缓存，让首个用户秒开
+        try {
+            const cacheKey = 'home_aggregate_v1';
+            if (!cacheManager.get('detail', cacheKey)) {
+                const [heroData, ...rowDatas] = await Promise.all([
+                    homeFetchTmdb('/trending/all/week', 1),
+                    ...keys.map(k => homeGetExtCards(HOME_EXT_TARGETS[k][0], HOME_EXT_TARGETS[k][1]))
+                ]);
+                const hero = (heroData && Array.isArray(heroData.results))
+                    ? heroData.results.filter(i => i.backdrop_path).slice(0, 5).map(i => ({
+                        title: i.title || i.name,
+                        originalTitle: i.original_title || i.original_name || '',
+                        overview: i.overview || '精彩内容不容错过',
+                        backdrop: i.backdrop_path,
+                        poster: i.poster_path || '',
+                        rawData: i
+                    }))
+                    : [];
+                const rows = siteHealthRows(keys.map(k => ({
+                    key: k,
+                    results: (rowDatas.shift() || []).slice(0, 8)
+                })));
+                cacheManager.set('detail', cacheKey, { hero, rows, sorted: true, updatedAt: Date.now() }, 90);
+            }
+        } catch (e) {
+            console.warn('[P0-3] Aggregate warmup skipped:', e.message);
+        }
+        console.log('[P0-3] 启动预热完成');
+    } catch (e) {
+        console.warn('[P0-3] 启动预热异常:', e.message);
+    }
+}
 
 // 1. 获取站点列表
 app.get('/api/sites', async (req, res) => {
@@ -2683,6 +2934,8 @@ if (!process.env.VERCEL) {
     app.listen(PORT, () => {
         console.log(`Server running on http://localhost:${PORT}`);
         console.log(`Image Cache Directory: ${IMAGE_CACHE_DIR}`);
+        // P0-3 启动预热：延迟数秒在后台预热首页各源 + 构建聚合缓存（不阻塞首启响应）
+        setTimeout(() => { startupWarmup().catch(() => { }); }, 3000);
     });
 }
 

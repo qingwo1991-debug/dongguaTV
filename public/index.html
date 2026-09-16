@@ -4290,8 +4290,16 @@
                         } catch (e) {
                             console.error('[InitApp] Hero 加载失败:', e);
                         }
+                        // 🚀 P0-1: 优先尝试首页聚合秒开；聚合到的行数传给 fetchAllLists 跳过
+                        let aggregatedRows = [];
                         try {
-                            this.fetchAllLists();
+                            aggregatedRows = await this.tryLoadHomeAggregate();
+                        } catch (e) {
+                            console.error('[InitApp] Home 聚合失败:', e);
+                            aggregatedRows = [];
+                        }
+                        try {
+                            this.fetchAllLists(aggregatedRows);
                         } catch (e) {
                             console.error('[InitApp] Lists 加载失败:', e);
                         }
@@ -5587,8 +5595,53 @@
                 },
 
                 // 初始化榜单 (优先加载首屏可见榜单)
-                fetchAllLists() {
-                    const keys = Object.keys(this.rowConfigs);
+                // ========== 🚀 P0-1 首页聚合首屏 ==========
+                // 优先请求 /api/home（后端一次并行返回 hero + 前 9 行）。成功则秒填充首屏，
+                // 其余行照常由 fetchAllLists 补拉；接口失败/超时自动回退传统逐行。
+                // 返回聚合已填充的行 key，fetchAllLists 据此跳过，避免重复请求。
+                async tryLoadHomeAggregate() {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), 12000);
+                    try {
+                        const res = await fetch('/api/home', { signal: controller.signal });
+                        if (!res.ok) return [];
+                        const data = await res.json();
+                        if (!data || !Array.isArray(data.rows)) return [];
+
+                        // hero：仅当逐行 fetchHero 尚未就绪时填充，避免闪变
+                        if (!this.heroList.length && Array.isArray(data.hero) && data.hero.length) {
+                            this.heroList = data.hero.map(h => ({
+                                title: h.title,
+                                originalTitle: h.originalTitle || '',
+                                overview: h.overview || '精彩内容不容错过',
+                                backdrop: h.backdrop ? `${TMDB_BACKDROP_URL}${h.backdrop}` : '',
+                                rawData: h.rawData
+                            }));
+                        }
+
+                        const filled = [];
+                        data.rows.forEach(row => {
+                            const key = row.key;
+                            if (!key || !Array.isArray(row.results) || !row.results.length) return;
+                            if (!this.rowConfigs[key]) return; // 只填充已知行
+                            // 复用 fetchRow 相同映射（EXT 行 results 已是 ext 卡片形状）
+                            this.rowLists[key] = row.results;
+                            if (this.rowLists[key].length) filled.push(key);
+                        });
+                        console.log(`[P0-1] /api/home 聚合首屏: 填充 ${filled.length} 行:`, filled.join(', '));
+                        return filled;
+                    } catch (e) {
+                        console.warn('[Home-Aggregate] 聚合失败，回退逐行加载:', e.message);
+                        return [];
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                },
+
+                fetchAllLists(aggregatedKeys = []) {
+                    // P0-1: 聚合已填充的行不再逐行重复请求
+                    const skipSet = new Set(Array.isArray(aggregatedKeys) ? aggregatedKeys : []);
+                    const keys = Object.keys(this.rowConfigs).filter(k => !skipSet.has(k));
 
                     // 设备检测（仅用于日志）
                     const viewportWidth = window.innerWidth;
