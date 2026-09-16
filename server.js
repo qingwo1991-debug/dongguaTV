@@ -1854,13 +1854,17 @@ async function homeGetExtCards(siteKey, tab) {
             const r = await runExtJs(site, 'getCards', tabArg, runOpts);
             return r && Array.isArray(r.list) ? r.list : [];
         };
-
-        let items = await loadCards();
+        // 每源 8s 独立截止：单行慢/坏源不拖累整个首页聚合
+        const withTimeout = (p, ms = 8000) => Promise.race([
+            p,
+            new Promise((_, rej) => setTimeout(() => rej(new Error('home-timeout')), ms))
+        ]);
+        let items = await withTimeout(loadCards());
         // 与 /api/ext/cards 相同：HTTP200空页时先走代理、再走纯直连，兼容两类地区限制源
         if (items.length === 0 && siteKey !== 'huangguo') {
             for (const routeMode of ['proxy', 'direct']) {
                 try {
-                    const retried = await loadCards(routeMode);
+                    const retried = await withTimeout(loadCards(routeMode), 6000);
                     if (retried.length > 0) {
                         items = retried;
                         console.log(`[HOME] ${site.name} auto empty, recovered via ${routeMode}: ${retried.length}`);
