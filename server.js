@@ -2087,7 +2087,13 @@ app.get('/api/search', async (req, res) => {
                 console.error(`[Search JSON] ${site.name}:`, err.message);
             }
         });
-        await Promise.all(searchPromises);
+        // ⏱ 非流式搜索上限 8s：多数源本地已有缓存或响应快，最快几秒即可返回；
+        //    个别坏源/慢源(extSearch 最长 25s)不拖垮整个请求——8s 后会返回目前已收集到的结果。
+        //    这让 playRecommendation/继续播放的"直达播放"在 12s 边界内能拿到数据，而不是整体超时回退。
+        await Promise.race([
+            Promise.all(searchPromises),
+            new Promise(resolve => setTimeout(resolve, 8000))
+        ]);
         return res.json({ list: allResults });
     }
 

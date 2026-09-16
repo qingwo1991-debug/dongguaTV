@@ -4989,9 +4989,11 @@
                         }
                     }
 
-                    // 没有保存的数据或解析失败，使用搜索
-                    console.log('[观看历史] 没有保存数据或解析失败，使用搜索');
-                    await this.autoSearch(item.name);
+                    // 没有保存的数据或解析失败 → 不再干等全量搜索(全源 timeout 会让用户感觉"没播放")
+                    // 🎯 走推荐直达: 后台聚合搜一次(8s 内返回已收集结果)，能匹配就直达播放页，
+                    //    全网彻底没有才回退搜索页并明确提示。
+                    console.log('[观看历史] 没有保存数据或解析失败，聚合搜源直达播放');
+                    await this.playRecommendation({ title: item.name, originalTitle: item.originalTitle || '' });
                 },
 
                 // 滚动观看历史（不触发 fetchRow）
