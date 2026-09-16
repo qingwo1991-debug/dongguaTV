@@ -43,7 +43,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Node dependencies
-        run: npm ci
+        run: npm install
 
       # 保险措施：创建 www 目录并复制 public 内容 (防止 CLI 回退默认 www 时报错)
       - name: Prepare Web Assets
@@ -61,14 +61,42 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           echo "📝 Applying manual configuration..."
-          # 使用 jq 修改 JSON (ubuntu-latest 预装了 jq)
+          
+          # 1. 修改 capacitor.config.json (server URL + appName)
           tmp=$(mktemp)
           jq --arg url "${{ inputs.server_url }}" --arg name "${{ inputs.app_name }}" \
              '.server.url = $url | .appName = $name' capacitor.config.json > "$tmp" && mv "$tmp" capacitor.config.json
           
+          # 2. 修改 Android 原生文件 (capacitor sync 不会传播这些字段)
+          STRINGS_FILE="android/app/src/main/res/values/strings.xml"
+          GRADLE_FILE="android/app/build.gradle"
+          APP_NAME="${{ inputs.app_name }}"
+          VERSION_TAG="${{ inputs.version_tag }}"
+          
+          # 2a. 更新 strings.xml 中的 app_name 和 title_activity_main
+          sed -i "s|<string name=\"app_name\">.*</string>|<string name=\"app_name\">${APP_NAME}</string>|" "$STRINGS_FILE"
+          sed -i "s|<string name=\"title_activity_main\">.*</string>|<string name=\"title_activity_main\">${APP_NAME}</string>|" "$STRINGS_FILE"
+          
+          # 2b. 从 version_tag 提取版本号 (去掉 v 前缀, 如 v1.2.3 -> 1.2.3)
+          VERSION_NAME="${VERSION_TAG#v}"
+          # 计算 versionCode: major*10000 + minor*100 + patch (如 1.2.3 -> 10203)
+          VERSION_CODE=$(echo "$VERSION_NAME" | awk -F. '{printf "%d", ($1*10000 + $2*100 + $3)}')
+          # 如果解析失败则使用默认值 1
+          [ "$VERSION_CODE" -eq 0 ] 2>/dev/null && VERSION_CODE=1
+          
+          sed -i "s|versionCode [0-9]*|versionCode $VERSION_CODE|" "$GRADLE_FILE"
+          sed -i "s|versionName \".*\"|versionName \"$VERSION_NAME\"|" "$GRADLE_FILE"
+          
           echo "✅ Configuration updated:"
-          echo "   App Name: ${{ inputs.app_name }}"
+          echo "   App Name: ${APP_NAME}"
           echo "   Server URL: ${{ inputs.server_url }}"
+          echo "   Version: ${VERSION_NAME} (code: ${VERSION_CODE})"
+          echo ""
+          echo "=== strings.xml ==="
+          cat "$STRINGS_FILE"
+          echo ""
+          echo "=== build.gradle (version lines) ==="
+          grep -E "versionCode|versionName" "$GRADLE_FILE"
 
       # 显示当前 Capacitor 配置
       - name: Show Capacitor Config
@@ -76,6 +104,20 @@ jobs:
           echo "=== Capacitor Config ==="
           cat capacitor.config.json
 
+      # Tag 触发时也更新版本号 (workflow_dispatch 已在上一步处理)
+      - name: Update Version from Tag
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          GRADLE_FILE="android/app/build.gradle"
+          VERSION_TAG="${GITHUB_REF#refs/tags/}"
+          VERSION_NAME="${VERSION_TAG#v}"
+          VERSION_CODE=$(echo "$VERSION_NAME" | awk -F. '{printf "%d", ($1*10000 + $2*100 + $3)}')
+          [ "$VERSION_CODE" -eq 0 ] 2>/dev/null && VERSION_CODE=1
+          
+          sed -i "s|versionCode [0-9]*|versionCode $VERSION_CODE|" "$GRADLE_FILE"
+          sed -i "s|versionName \".*\"|versionName \"$VERSION_NAME\"|" "$GRADLE_FILE"
+          
+          echo "✅ Version updated from tag: ${VERSION_NAME} (code: ${VERSION_CODE})"
       # 从网站图标生成 Android App 图标（各分辨率）
       - name: Generate App Icons from Website Icon
         run: |
@@ -239,8 +281,7 @@ jobs:
             ### 📺 设备兼容性
             - ✅ 手机 (Android 5.0+)
             - ✅ 平板
-            - ✅ Android TV / 电视盒子
-            - ✅ 智能投影仪
+            - 📺 电视/盒子: 推荐使用电视浏览器访问网页版，兼容性更佳
             
             ### 🌐 内置服务器
             - 默认连接: `${{ github.event.inputs.server_url || 'https://ednovas.video' }}`

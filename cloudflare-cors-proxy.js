@@ -111,8 +111,35 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
         // 设置超时 (20秒，视频流需要更长时间)
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 20000);
-        const response = await fetch(proxyRequest, { signal: controller.signal });
+        let response = await fetch(proxyRequest, { signal: controller.signal });
         clearTimeout(timeoutId);
+
+        // 📊 诊断日志(wrangler tail 可见)：只对失败请求打点(不刷屏成功的 .ts 分段)。
+        //    server=cloudflare + 403 ⇒ 上游本身在 CF 后面、在封你 worker 的 IP(换头救不了)；404 ⇒ 链接失效/被按 IP 拒。
+        if (!response.ok) {
+            console.log(`[proxy] ${request.method} ${targetURL.host}${targetURL.pathname} first=${response.status} server=${response.headers.get('server') || '-'} cf-cache=${response.headers.get('cf-cache-status') || '-'} ct=${response.headers.get('content-type') || '-'}`);
+        }
+
+        // 🔁 防盗链回退：部分 CDN 带"外来 Referer/Origin"反而被拒(常见 403，也有用 404/401 隐藏的)。
+        //    失败时去掉 Referer/Origin 再拉一次(仅 GET/HEAD、仅在失败时；成功才采用，否则保留首次结果)。
+        //    注意：对"封 Cloudflare/境外 IP"的源无效(那是 IP 问题，换头救不了)，但能多救回"仅因 Referer 被拒"的源。
+        if ([401, 403, 404, 451].includes(response.status) &&
+            (request.method === 'GET' || request.method === 'HEAD')) {
+            const retryHeaders = new Headers(headers);
+            retryHeaders.delete('Referer');
+            retryHeaders.delete('Origin');
+            const retryController = new AbortController();
+            const retryTimeoutId = setTimeout(() => retryController.abort(), 20000);
+            try {
+                const retryResp = await fetch(
+                    new Request(targetURL.toString(), { method: request.method, headers: retryHeaders }),
+                    { signal: retryController.signal }
+                );
+                console.log(`[proxy] ${targetURL.host}${targetURL.pathname} noRefererRetry status=${retryResp.status} adopted=${retryResp.ok}`);
+                if (retryResp.ok) response = retryResp;
+            } catch (e) { console.log(`[proxy] ${targetURL.host}${targetURL.pathname} noRefererRetry threw ${e.name}`); /* 保留首次响应交给前端自动换源 */ }
+            clearTimeout(retryTimeoutId);
+        }
 
         // 构建响应头 - 先复制目标服务器的响应头，但排除 CORS 相关的头
         const responseHeaders = new Headers();
@@ -157,6 +184,7 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
             responseHeaders.set('Content-Type', 'application/vnd.apple.mpegurl');
             responseHeaders.delete('Content-Length'); // 长度已变化
 
+            console.log(`[proxy] ${targetURL.host}${targetURL.pathname} FINAL=${response.status} m3u8=true`);
             return new Response(rewrittenContent, {
                 status: response.status,
                 statusText: response.statusText,
@@ -164,6 +192,7 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
             });
         }
 
+        if (!response.ok) console.log(`[proxy] ${targetURL.host}${targetURL.pathname} FINAL=${response.status} m3u8=false`);
         return new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
@@ -178,33 +207,284 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
 }
 
 /**
- * 重写 m3u8 内容，将里面的 URL 改为经过代理的 URL
- * 这样 ts 分片请求也会经过代理，解决防盗链问题
+ * 重写 m3u8 内容：
+ * 1. 过滤 SSAI 广告分段（整组移除）
+ * 2. 将 URL 改为经过代理的 URL（解决防盗链）
+ * 
+ * 广告过滤策略（v2.2 from KI）：
+ *   - 先提取全局 M3U8 头部标签
+ *   - 按 DISCONTINUITY 将分段分成多个"组"
+ *   - 广告组特征：3-120秒 且 <15个分段 → 整组移除
+ *   - 保留所有非广告组（可能有多个主内容组）
  */
 function rewriteM3u8(content, baseUrl, proxyOrigin) {
-    const lines = content.split('\n');
     const baseOrigin = baseUrl.origin;
     const basePath = baseUrl.pathname.substring(0, baseUrl.pathname.lastIndexOf('/') + 1);
+    const lines = content.split('\n');
 
-    return lines.map(line => {
-        const trimmedLine = line.trim();
+    // ===== 检查是否是主播放列表（含 #EXT-X-STREAM-INF）=====
+    // 主播放列表不包含广告分段，只做 URL 重写
+    const hasStreamInf = lines.some(l => l.trim().startsWith('#EXT-X-STREAM-INF'));
+    if (hasStreamInf) {
+        return rewriteMasterPlaylist(lines, baseOrigin, basePath, proxyOrigin);
+    }
 
-        // 跳过注释行和空行
-        if (trimmedLine.startsWith('#') || trimmedLine === '') {
-            // 但检查 URI= 属性（如 #EXT-X-KEY 中的加密密钥 URL）
-            if (trimmedLine.includes('URI="')) {
-                return line.replace(/URI="([^"]+)"/g, (match, uri) => {
-                    const absoluteUrl = resolveUrl(uri, baseOrigin, basePath);
-                    return `URI="${proxyOrigin}/?url=${encodeURIComponent(absoluteUrl)}"`;
-                });
-            }
-            return line;
+    // ===== 子播放列表：过滤广告 =====
+
+    // 第一步：提取全局头部标签（在第一个 #EXTINF 或 #EXT-X-DISCONTINUITY 之前的标签）
+    const globalHeaders = [];
+    let bodyStartIdx = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+        if (trimmed.startsWith('#EXTINF:') || trimmed === '#EXT-X-DISCONTINUITY') {
+            bodyStartIdx = i;
+            break;
+        }
+        // 跳过广告相关元标签
+        if (trimmed.startsWith('#EXT-X-CUE') || trimmed.startsWith('#EXT-X-DATERANGE') ||
+            trimmed.startsWith('#EXT-X-SCTE35')) {
+            continue;
+        }
+        if (trimmed === '#EXT-X-ENDLIST') continue;
+        if (trimmed === '' && i < 3) { globalHeaders.push(lines[i]); continue; }
+        if (trimmed.startsWith('#') || trimmed === '') {
+            globalHeaders.push(lines[i]);
+        }
+        bodyStartIdx = i + 1;
+    }
+
+    // 第二步：按 DISCONTINUITY 分组
+    const groups = [];
+    let currentGroup = { segments: [], duration: 0, segCount: 0 };
+
+    for (let i = bodyStartIdx; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+
+        // 跳过广告元标签
+        if (trimmed.startsWith('#EXT-X-CUE-OUT') || trimmed.startsWith('#EXT-X-CUE-IN') ||
+            trimmed.startsWith('#EXT-X-CUE') || trimmed.startsWith('#EXT-X-DATERANGE') ||
+            trimmed.startsWith('#EXT-X-SCTE35')) {
+            continue;
         }
 
-        // 处理媒体 URL（ts 分片或子 m3u8）
-        const absoluteUrl = resolveUrl(trimmedLine, baseOrigin, basePath);
-        return `${proxyOrigin}/?url=${encodeURIComponent(absoluteUrl)}`;
-    }).join('\n');
+        // DISCONTINUITY → 推入当前组，开始新组
+        if (trimmed === '#EXT-X-DISCONTINUITY') {
+            if (currentGroup.segCount > 0) {
+                groups.push(currentGroup);
+            }
+            currentGroup = { segments: [], duration: 0, segCount: 0 };
+            continue;
+        }
+
+        // ENDLIST → 跳过（最后统一加）
+        if (trimmed === '#EXT-X-ENDLIST') continue;
+
+        // EXTINF → 分段
+        if (trimmed.startsWith('#EXTINF:')) {
+            const durMatch = trimmed.match(/#EXTINF:([\d.]+)/);
+            const dur = durMatch ? parseFloat(durMatch[1]) : 0;
+            currentGroup.duration += dur;
+            currentGroup.segCount++;
+            currentGroup.segments.push(lines[i]);
+            // 下一行是 URL
+            if (i + 1 < lines.length) {
+                i++;
+                currentGroup.segments.push(lines[i]);
+            }
+            continue;
+        }
+
+        // 空行或其他标签 → 放入当前组
+        if (trimmed !== '') {
+            currentGroup.segments.push(lines[i]);
+        }
+    }
+
+    // 最后一组
+    if (currentGroup.segCount > 0) {
+        groups.push(currentGroup);
+    }
+
+    // 如果只有一组或无组，不需要过滤
+    if (groups.length <= 1) {
+        return rewriteUrlsOnly(lines, baseOrigin, basePath, proxyOrigin);
+    }
+
+    // 第三步：过滤广告组（基于 DISCONTINUITY 分组）
+    const keptGroups = [];
+    let adsRemoved = 0;
+    let adDuration = 0;
+
+    for (const g of groups) {
+        // 广告特征：3-120秒 且 <15个分段
+        const isAd = g.duration >= 3 && g.duration <= 120 && g.segCount < 15;
+
+        if (isAd) {
+            adsRemoved++;
+            adDuration += g.duration;
+        } else {
+            keptGroups.push(g);
+        }
+    }
+
+    // 第三步 B：清理组内嵌入的单条广告/追踪分段
+    // 例如：尾部 0.01s 的 unibet666.vip 追踪像素，或中间插入的跨域广告 URL
+    for (const g of keptGroups) {
+        const cleanedSegments = [];
+        for (let i = 0; i < g.segments.length; i++) {
+            const line = g.segments[i];
+            const trimmed = line.trim();
+
+            // 检查 EXTINF + 下一行 URL 的组合
+            if (trimmed.startsWith('#EXTINF:')) {
+                const durMatch = trimmed.match(/#EXTINF:([\d.]+)/);
+                const dur = durMatch ? parseFloat(durMatch[1]) : 0;
+                const nextLine = (i + 1 < g.segments.length) ? g.segments[i + 1].trim() : '';
+
+                // 判断是否为嵌入式广告/追踪分段：
+                // 1) 极短时长 (< 0.5s) 且目标是完整 URL（非相对路径 .ts）
+                // 2) URL 指向已知广告/赌博/追踪域名
+                const isTracker = dur < 0.5 && /^https?:\/\//i.test(nextLine) && !/\.ts(\?|$)/i.test(nextLine);
+                const isAdDomain = /^https?:\/\//i.test(nextLine) && /\.(vip|bet|casino|click|top|xyz|buzz)\//i.test(nextLine);
+
+                if (isTracker || isAdDomain) {
+                    // 跳过这个 EXTINF 和下一行的 URL
+                    adsRemoved++;
+                    adDuration += dur;
+                    i++; // 跳过 URL 行
+                    continue;
+                }
+            }
+
+            cleanedSegments.push(line);
+        }
+        g.segments = cleanedSegments;
+    }
+
+    // 如果没有过滤掉任何组，直接做 URL 重写
+    if (adsRemoved === 0) {
+        return rewriteUrlsOnly(lines, baseOrigin, basePath, proxyOrigin);
+    }
+
+    // 第四步：重建 M3U8
+    const output = [];
+
+    // 输出全局头部（跳过 TARGETDURATION，后面重新计算）
+    let maxSegDur = 0;
+    for (const g of keptGroups) {
+        for (const line of g.segments) {
+            const t = line.trim();
+            if (t.startsWith('#EXTINF:')) {
+                const m = t.match(/#EXTINF:([\d.]+)/);
+                if (m) maxSegDur = Math.max(maxSegDur, Math.ceil(parseFloat(m[1])));
+            }
+        }
+    }
+
+    for (const line of globalHeaders) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('#EXT-X-TARGETDURATION')) {
+            output.push(`#EXT-X-TARGETDURATION:${maxSegDur || 4}`);
+        } else {
+            output.push(line);
+        }
+    }
+
+    // 输出保留的分段组（TS 分段直连 CDN，不走代理）
+    // 组与组之间保留 DISCONTINUITY，告知解码器重置时间戳（防止音画不同步）
+    for (let gi = 0; gi < keptGroups.length; gi++) {
+        if (gi > 0) {
+            output.push('#EXT-X-DISCONTINUITY');
+        }
+        const g = keptGroups[gi];
+        for (const line of g.segments) {
+            const trimmed = line.trim();
+            if (trimmed === '' || trimmed.startsWith('#')) {
+                if (trimmed.includes('URI="')) {
+                    output.push(line.replace(/URI="([^"]+)"/g, (match, uri) => {
+                        const absoluteUrl = resolveUrl(uri, baseOrigin, basePath);
+                        return `URI="${proxyOrigin}/?url=${encodeURIComponent(absoluteUrl)}"`;
+                    }));
+                } else {
+                    output.push(line);
+                }
+            } else {
+                const absoluteUrl = resolveUrl(trimmed, baseOrigin, basePath);
+                output.push(absoluteUrl);
+            }
+        }
+    }
+
+    output.push('#EXT-X-ENDLIST');
+
+    console.log(`[AdFilter] Removed ${adsRemoved} ad groups (${adDuration.toFixed(1)}s), kept ${keptGroups.length} content groups (${groups.length} total)`);
+
+    return output.join('\n');
+}
+
+/**
+ * 主播放列表（含 #EXT-X-STREAM-INF）→ 只做 URL 重写
+ */
+function rewriteMasterPlaylist(lines, baseOrigin, basePath, proxyOrigin) {
+    const output = [];
+    for (let i = 0; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+        if (trimmed === '' || trimmed.startsWith('#')) {
+            output.push(lines[i]);
+        } else {
+            // 子播放列表 URL → 代理重写
+            const absoluteUrl = resolveUrl(trimmed, baseOrigin, basePath);
+            output.push(`${proxyOrigin}/?url=${encodeURIComponent(absoluteUrl)}`);
+        }
+    }
+    return output.join('\n');
+}
+
+/**
+ * 纯 URL 重写（无 DISCONTINUITY 广告过滤，但仍清理嵌入式追踪分段）
+ */
+function rewriteUrlsOnly(lines, baseOrigin, basePath, proxyOrigin) {
+    const output = [];
+    let skippedCount = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+
+        // 检查嵌入式广告/追踪分段
+        if (trimmed.startsWith('#EXTINF:')) {
+            const durMatch = trimmed.match(/#EXTINF:([\d.]+)/);
+            const dur = durMatch ? parseFloat(durMatch[1]) : 0;
+            const nextLine = (i + 1 < lines.length) ? lines[i + 1].trim() : '';
+
+            const isTracker = dur < 0.5 && /^https?:\/\//i.test(nextLine) && !/\.ts(\?|$)/i.test(nextLine);
+            const isAdDomain = /^https?:\/\//i.test(nextLine) && /\.(vip|bet|casino|click|top|xyz|buzz)\//i.test(nextLine);
+
+            if (isTracker || isAdDomain) {
+                skippedCount++;
+                i++; // 跳过 URL 行
+                continue;
+            }
+        }
+
+        if (trimmed === '' || trimmed.startsWith('#')) {
+            if (trimmed.includes('URI="')) {
+                output.push(lines[i].replace(/URI="([^"]+)"/g, (match, uri) => {
+                    const absoluteUrl = resolveUrl(uri, baseOrigin, basePath);
+                    return `URI="${proxyOrigin}/?url=${encodeURIComponent(absoluteUrl)}"`;
+                }));
+            } else {
+                output.push(lines[i]);
+            }
+        } else {
+            // TS/媒体分段 → 直连 CDN
+            const absoluteUrl = resolveUrl(trimmed, baseOrigin, basePath);
+            output.push(absoluteUrl);
+        }
+    }
+    if (skippedCount > 0) {
+        console.log(`[AdFilter] rewriteUrlsOnly: removed ${skippedCount} inline tracker(s)`);
+    }
+    return output.join('\n');
 }
 
 /**
