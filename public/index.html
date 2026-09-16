@@ -3778,6 +3778,29 @@
         //    防止旧剧的回调把内容灌进新剧的播放器（串剧）。
         let _navSeq = 0;
 
+        // 🚰 详情接口单飞池：同一 (site_key,vod_id[,url]) 同时只发一个 /api/detail 请求。
+        //    switchSource(开播) / latencyPromises(测速) / prefetchExtCard(预取) 原本会各自重复拉同一剧的
+        //    详情(实测同剧多卡 hover + 开播 = 3-4 次重复请求)；现在并发者共享同一个进行中的 Promise，
+        //    服务端同时只收到 1 次 —— 消冗余、降带宽、源站压力大减。
+        const _detailInflight = new Map();
+        function fetchDetailOnce(site_key, vod_id, meta = '') {
+            const key = `${site_key}|${vod_id}|${meta}`;
+            if (_detailInflight.has(key)) return _detailInflight.get(key);
+            const p = fetch(`/api/detail?site_key=${encodeURIComponent(site_key)}&id=${encodeURIComponent(vod_id)}${meta}`)
+                .then(r => r.json())
+                .finally(() => _detailInflight.delete(key));
+            _detailInflight.set(key, p);
+            return p;
+        }
+
+        // 🔁 详情请求去包装：各消费方拿到的可能是 {list:[...]} 或直接对象，统一抽成 list。
+        function detailToList(data) {
+            if (!data) return [];
+            if (Array.isArray(data.list)) return data.list;
+            if (Array.isArray(data)) return data;
+            return [];
+        }
+
         // 💾 倍速恢复辅助 — 多次重试确保 HLS.js 不会重置
         function ensurePlaybackSpeed(player) {
             try {
@@ -6057,14 +6080,12 @@
                     this._extCardPrefetched = this._extCardPrefetched || new Set();
                     if (this._extCardPrefetched.has(key)) return;
                     this._extCardPrefetched.add(key);
-                    let url = `/api/detail?site_key=${encodeURIComponent(item.site_key)}&id=${encodeURIComponent(item.vod_id)}`;
-                    if (item.detail_url || (item.ext && item.ext.url)) {
-                        url += `&url=${encodeURIComponent(item.detail_url || item.ext.url)}`;
-                    }
-                    fetch(url)
-                        .then(r => r.json())
+                    const urlExtra = (item.detail_url || (item.ext && item.ext.url))
+                        ? `&url=${encodeURIComponent(item.detail_url || item.ext.url)}`
+                        : '';
+                    fetchDetailOnce(item.site_key, item.vod_id, urlExtra)
                         .then(data => {
-                            const detail = data && data.list && data.list[0];
+                            const detail = detailToList(data)[0];
                             if (!detail || !detail.vod_play_url) return;
                             const first = detail.vod_play_url.split('#')[0] || '';
                             const parts = first.split('$');
@@ -6283,17 +6304,16 @@
                         source.latency = '...';
                         source._useProxy = false;  // 默认不使用代理
                         try {
-                            // 1. 先获取该线路的视频详情
-                            const detailRes = await fetch(`/api/detail?site_key=${source.site_key}&id=${source.vod_id}`);
-                            const detailData = await detailRes.json();
-
-                            if (!detailData.list || detailData.list.length === 0) {
+                            // 1. 先获取该线路的视频详情（🚰 单飞去重：与 switchSource/prefetch 并发共享同一请求）
+                            const detailRes = await fetchDetailOnce(source.site_key, source.vod_id);
+                            const detailData = detailRes;
+                            if (!detailToList(detailData).length) {
                                 source.latency = 9999;
                                 return source;
                             }
 
                             // 2. 解析出第一个 m3u8 视频 URL
-                            const detail = detailData.list[0];
+                            const detail = detailToList(detailData)[0];
                             let playUrl = detail.vod_play_url || '';
 
                             // 处理多线路格式 (用 $$$ 分隔)
@@ -6432,10 +6452,11 @@
                             // 获取详情失败的兜底处理
                             if (e.name !== 'AbortError') {
                                 try {
-                                    const detailRes = await fetch(`/api/detail?site_key=${source.site_key}&id=${source.vod_id}`);
-                                    const detailData = await detailRes.json();
-                                    if (detailData.list && detailData.list.length > 0) {
-                                        source._cachedDetail = detailData.list[0];
+                                    const detailRes = await fetchDetailOnce(source.site_key, source.vod_id);
+                                    const detailData = detailRes;
+                                    const dl = detailToList(detailData);
+                                    if (dl.length > 0) {
+                                        source._cachedDetail = dl[0];
                                         // 无法直接测试，回退到服务器端延迟
                                         const checkRes = await fetch(`/api/check?key=${source.site_key}`);
                                         const checkData = await checkRes.json();
@@ -6571,10 +6592,11 @@
                             const metaParam = isExtSource
                                 ? `&name=${encodeURIComponent(this.currentGroup?.name || source.vod_name || '')}&pic=${encodeURIComponent(source.vod_pic || this.currentGroup?.pic || '')}`
                                 : '';
-                            const res = await fetch(`/api/detail?site_key=${source.site_key}&id=${source.vod_id}${metaParam}${source.detail_url || (source.ext && source.ext.url) ? `&url=${encodeURIComponent(source.detail_url || source.ext.url)}` : ''}`);
-                            const data = await res.json();
-                            if (data.list && data.list.length > 0) {
-                                detail = data.list[0];
+                            const urlExtra = source.detail_url || (source.ext && source.ext.url) ? `&url=${encodeURIComponent(source.detail_url || source.ext.url)}` : '';
+                            const data = await fetchDetailOnce(source.site_key, source.vod_id, `${metaParam}${urlExtra}`);
+                            const dl = detailToList(data);
+                            if (dl.length > 0) {
+                                detail = dl[0];
                             }
                         }
 
