@@ -1737,32 +1737,21 @@ app.get('/api/ext/cards', async (req, res) => {
             }
         }
 
-        const results = rawItems.map(item => {
-            const id = String(item.vod_id || item.id || item.ext?.id || '');
-            const name = item.vod_name || item.name || item.title || '';
-            const remarks = String(item.vod_remarks || item.remarks || item.subTitle || '').replace(/<[^>]+>/g, '').trim();
-            const scoreMatch = remarks.match(/([\d\.]+)分/);
-            const score = scoreMatch ? parseFloat(scoreMatch[1]) : 8.8;
+        const results = rawItems.map(item => mapExtCard(item, siteKey, site.name));
 
-            return {
-                id: `ext_${siteKey}_${id}`,
-                vod_id: id,
-                title: name,
-                name: name,
-                original_title: '',
-                original_name: '',
-                poster_path: item.vod_pic || item.pic || item.cover || item.poster || '',
-                detail_url: item.ext?.url || item.ext?.play_url || '',
-                vote_average: score,
-                release_date: remarks || '精选',
-                first_air_date: remarks || '精选',
-                remarks: remarks,
-                site_key: siteKey,
-                site_name: site.name
-            };
-        });
+        // 📄 动态分页深度：不再写死 5 页。EXT 短剧源(黄果/河马等)实际能翻几十上百页，
+        //    按源+tab 给真实上限(深源可翻更多)，浅源翻到空页前端自然截断。
+        //    前端 fetchRow 以"results 为空"兜底停更，此处给上限避免死循环请求空页。
+        let totalPages = 5; // 默认兜底
+        const DEEP_PAGE_TABS = ['ai-duanju', 'ranks/hot', 'all']; // 可深翻的分类
+        if (siteKey === 'huangguo') {
+            totalPages = DEEP_PAGE_TABS.includes(tab) ? 60 : 10;   // 黄果分类/榜单可翻 60 页
+        } else {
+            // 其它 EXT 源保守给 10 页(多数只支持有限页)，翻空自动停
+            totalPages = 10;
+        }
 
-        const data = { results, total_pages: 5, page, route: routeUsed };
+        const data = { results, total_pages: totalPages, page, route: routeUsed };
         if (results.length > 0) {
             cacheManager.set('detail', cacheKey, data, 300); // 推荐列表缓存 5 分钟，兼顾实时更新与加载速度
             recordSiteHealth(siteKey, true);
@@ -1851,6 +1840,47 @@ function siteHealthRows(rows) {
         if (!ta) return 1;
         return siteHealthScore(tb[0]) - siteHealthScore(ta[0]);
     });
+}
+
+// 🏷 EXT 卡片统一映射：透传上游类型/年份/真实评分，并从 remarks 解析出可筛选的
+//    类型标签(genre) 与评分。首页聚合 /api/ext/cards 与 /api/home 共用，字段一致。
+function mapExtCard(item, siteKey, siteName) {
+    const id = String(item.vod_id || item.id || item.ext?.id || '');
+    const name = item.vod_name || item.name || item.title || '';
+    const remarks = String(item.vod_remarks || item.remarks || item.subTitle || '').replace(/<[^>]+>/g, '').trim();
+    let score = 8.8;
+    const upScore = parseFloat(item.vod_score) || parseFloat(item.score);
+    if (upScore) score = upScore;
+    else { const sm = remarks.match(/([\d\.]+)分/); if (sm) score = parseFloat(sm[1]); }
+    score = Math.min(10, Math.max(0, score));
+    let typeName = item.type_name || item.category || item.class_name || '';
+    const yearRaw = item.vod_year || item.year || '';
+    const genre = [];
+    // 📺 更新至第几集（"更新至03集"/"18小时前更新至1集"里挖出来，可做筛选维度）
+    let updateEp = '';
+    try {
+        const upm = remarks.match(/(?:更新至|更新到|更至)?\s*(\d{1,4})集/);
+        if (upm) updateEp = upm[1];
+        for (const t of remarks.split('·').map(s => s.trim()).filter(Boolean)) {
+            if (/^[\d.]+分$/.test(t)) continue;                         // "9.4分"
+            if (/^[\d.,万]+集?$/.test(t)) continue;                     // "187集" "7.85万"
+            if (/^更新至?\d+集$/i.test(t)) continue;                    // "更新至03集"
+            if (/^第\d+集$/i.test(t)) continue;                         // "第04集"
+            if (/^(?:刚刚|[\d.]+(?:小时|天|分钟|分|秒))前.*(?:更新|至)?/i.test(t)) continue; // "18小时前更新至1集"
+            if (t === '正片' || t === '精选' || t === '全集' || t === '全') continue;
+            if (!genre.includes(t)) genre.push(t);
+        }
+    } catch (e) { }
+    if (!typeName && genre.length) typeName = genre[0];
+    return {
+        id: `ext_${siteKey}_${id}`, vod_id: id, title: name, name: name,
+        original_title: '', original_name: '',
+        poster_path: item.vod_pic || item.pic || item.cover || item.poster || '',
+        detail_url: item.ext?.url || item.ext?.play_url || '',
+        vote_average: score, score, genre, type_name: typeName, year: yearRaw || '', updateEp,
+        release_date: remarks || '精选', first_air_date: remarks || '精选', remarks,
+        site_key: siteKey, site_name: siteName
+    };
 }
 
 // ========== 🔥 搜索热词 TTL ==========
@@ -1949,6 +1979,7 @@ async function homeGetExtCards(siteKey, tab, timeoutMs = 8000) {
             const r = await runExtJs(site, 'getCards', tabArg, runOpts);
             return r && Array.isArray(r.list) ? r.list : [];
         };
+        // 🏷 卡片映射统一走顶层 mapExtCard（透传类型/年份/真实评分 + 解析 genre 标签）
         // 每源独立截止：单行慢/坏源不拖累整个首页聚合
         const withTimeout = (p, ms = timeoutMs) => Promise.race([
             p,
@@ -1973,23 +2004,10 @@ async function homeGetExtCards(siteKey, tab, timeoutMs = 8000) {
 
         if (items.length > 0) {
             recordSiteHealth(siteKey, true);
-            const results = items.map(item => {
-                const id = String(item.vod_id || item.id || item.ext?.id || '');
-                const name = item.vod_name || item.name || item.title || '';
-                const remarks = String(item.vod_remarks || item.remarks || item.subTitle || '').replace(/<[^>]+>/g, '').trim();
-                const scoreMatch = remarks.match(/([\d\.]+)分/);
-                const score = scoreMatch ? parseFloat(scoreMatch[1]) : 8.8;
-                return {
-                    id: `ext_${siteKey}_${id}`, vod_id: id, title: name, name: name,
-                    original_title: '', original_name: '',
-                    poster_path: item.vod_pic || item.pic || item.cover || item.poster || '',
-                    detail_url: item.ext?.url || item.ext?.play_url || '',
-                    vote_average: score, release_date: remarks || '精选',
-                    first_air_date: remarks || '精选', remarks: remarks,
-                    site_key: siteKey, site_name: site.name
-                };
-            });
-            const data = { results, total_pages: 5, page: 1, route: 'auto' };
+            const results = items.map(item => mapExtCard(item, siteKey, site.name));
+            // 首页聚合同样按源给真实深度(黄果可深翻)，浅源兜底；前端 fetchRow 空页自动停
+            const hp = siteKey === 'huangguo' ? 60 : 10;
+            const data = { results, total_pages: hp, page: 1, route: 'auto' };
             if (results.length > 0) cacheManager.set('detail', `ext_cards_${siteKey}_${tab}_1`, data, 300);
             return results.slice(0, 10);
         }
